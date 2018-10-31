@@ -1,0 +1,4 @@
+python3 Parse_GFF_LongestTranscript.py -g /panfs/roc/groups/6/maize/shared/databases/genomes/Zea_mays/B73/Zea_mays.AGPv4.33.gff3 -i Parent -o Zea_mays.AGPv4.33_Longest_transcript_Exons.gff
+python3 Parse_GFF_LongestTranscript.py -g /panfs/roc/groups/6/maize/shared/databases/genomes/Zea_mays/PH207/ZmaysPH207_443_v1.1.gene_exons.gff3 -i Parent -o ZmaysPH207_443_v1.1.gene_exons_Longest_Transcript_Exon.gff3
+python3 Parse_GFF_LongestTranscript.py -g /panfs/roc/groups/6/maize/shared/databases/genomes/Zea_mays/W22/zea_maysw22_core_fixchr.gff -i Parent -o zea_maysw22_core_fixchr_Longest_Transcript_Exon.gff
+python3 Parse_GFF_LongestTranscript.py -g /panfs/roc/groups/6/maize/shared/databases/genomes/Sorghum_bicolor/btx623/Sbicolor_313_v3.1.gene_exons.gff3 -i Parent -o Sbicolor_313_v3.1.gene_exons_Longest_Transcript_Exon.gff3
