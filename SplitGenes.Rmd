@@ -1,0 +1,657 @@
+---
+title: "SplitGenes"
+author: "Patrick Monnahan"
+date: "9/4/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+require(data.table)
+require(dplyr)
+require(tidyr)
+require(ggplot2)
+require(ggridges)
+require(parallel)
+require(gridExtra)
+require(stringr)
+require(tibble)
+# Coordinate conversion results
+ccr = read.table("~/Documents/Research/MaizeSV/data/convert_coords_results.txt")
+setnames(ccr, old = c("V1","V2","V3","V4"), new = c("from","to","match","len"))
+
+# Combine HTSeq count data with splitGene bed info
+b.splits = read.table("~/Documents/Research/Split_genes/input/B73_LT_HTseq_splitGene_key.txt")
+b.fsplits = read.table("~/Documents/Research/Split_genes/input/B73_splitGenes_fake_m4.txt")
+b.counts=read.table("~/Documents/Research/Split_genes/input/Samples_LT_B73_Ref_HTseq.txt", head=T)
+w.splits = read.table("~/Documents/Research/Split_genes/input/W22_LT_HTseq_splitGene_key.txt")
+w.fsplits = read.table("~/Documents/Research/Split_genes/input/W22_splitGenes_fake_m4.txt")
+w.counts=read.table("~/Documents/Research/Split_genes/input/Samples_LT_W22_Ref_HTseq.txt", head=T)
+p.splits = read.table("~/Documents/Research/Split_genes/input/PH207_LT_HTseq_splitGene_key.txt")
+p.fsplits = read.table("~/Documents/Research/Split_genes/input/PH207_splitGenes_fake_m4.txt")
+p.counts=read.table("~/Documents/Research/Split_genes/input/Samples_LT_PH207_Ref_HTseq.txt", head=T)
+
+p.Counts=read.table("~/Documents/Research/Split_genes/input/Samples_PH207_Ref_HTseq.txt", head=T)
+b.Counts=read.table("~/Documents/Research/Split_genes/input/Samples_B73_Ref_HTseq.txt", head=T)
+w.Counts=read.table("~/Documents/Research/Split_genes/input/Samples_W22_Ref_HTseq.txt", head=T)
+
+
+setnames(p.splits, old = oldNames, new = newNames)
+  setnames(p.fsplits, old = c(oldNames,"V11"), new = c(newNames, "source"))
+  setnames(p.counts, old = c("Genes"), new = c("exon"))
+  
+# STILL SOME ERRORS WITH SPLIT GENE KEY.  SOME ALT REF GENES HAVE CLEARLY BEEN PUT IN WRONG PLACE. E.G Zm00004b037741
+munge = function(counts, realSplits, fakeSplits){
+  realSplits['source'] = "real"
+  splits = rbind(realSplits, fakeSplits)
+  d = merge(splits, counts, by = c("exon"), all.y=TRUE)
+  d.m = melt(d, id.vars = c("exon","chrom" ,"pos.exon","end.exon","gene","pos.gene","end.gene","parent","prog","famnum", "source"))
+  d.n = d.m %>% mutate(ref = str_split_fixed(as.character(variable), "_", 3)[,3], sample = str_split_fixed(as.character(variable), "[.]", 3)[,1], tissue = str_split_fixed(as.character(variable), "[.]", 3)[,2], rep = str_split_fixed(as.character(variable), "[.]", 3)[,3]) %>% mutate(rep = str_split_fixed(as.character(rep),"_",3)[,1]) %>% as.data.frame()
+  d.n = d.n %>% filter(!is.na(gene)) %>% filter(!exon %in% c("__alignment_not_unique", "__ambiguous", "__no_feature", "__not_aligned", "__too_low_aQual", "__alignment_not_unique")) %>% as.data.frame()
+  d.n$tissue = as.factor(d.n$tissue)
+  d.n$sample = as.factor(d.n$sample)
+  d.n$rep = as.factor(d.n$rep)
+ return(d.n) 
+}
+
+p = munge(p.counts, p.splits, p.fsplits)
+
+nn = colnames(p.counts)[2:61]
+mm = c(rep("B",20), rep("P",20), rep("W",20))
+tt = c(rep(c("A","A","Em","Em","En","En","IE","IE","I","I","L10","L10","L","L","R","R","SC","SC","T","T"),3))
+rr = c(rep(c("R1","R2"),30))
+coldata = data.frame(row.names = nn, geno = mm, tissue = tt, rep = rr)
+
+nsg = dcast(p, gene + prog ~ variable, value.var = "value", fun.aggregate = sum)
+
+dds = DESeqDataSetFromMatrix(countData = nsg[,3:62], colData = coldata, design = ~ geno + tissue + rep)
+
+dds = DESeq(dds)
+
+disp = data.frame(gene = nsg$gene, disp = dispersions(dds))
+
+pp = merge(p, disp, by=c("gene"), all.x = TRUE)
+
+pp = pp %>% filter(as.character(parent) != as.character(gene)) %>% as.data.frame()
+
+vR = function(df){
+  Theta = df$disp[1]
+  aa = glmer(value ~ (1|tissue) + (1|sample) + (1 | gene) + (rep | sample), data=df, family=MASS::negative.binomial(theta=Theta))
+  bb = as.data.frame(VarCorr(aa))
+  ratio = bb[bb$grp=="gene",4] / sum(bb[,4])
+  return(ratio)
+}
+
+varRatio2 = function(i){
+  Prog = as.character(unique(pp$prog)[i])
+  dat = pp %>% filter(as.character(prog)==Prog) %>% as.data.frame()
+  ratio = tryCatch({vR(dat)}, error = function(e) {return(-9)})
+  #ratio = vR(dat)
+  return(c(ratio, Prog))
+}
+
+runOne = function(master, Prog){
+  dat = master %>% filter(as.character(prog)==Prog & as.character(parent) != as.character(gene) & value > 1) %>% as.data.frame()
+  par = as.character(dat$parent[1])
+  dat["sval"] = dat$value/dat$basepairs
+  aa = lmer(log(value+1) ~ (1|tissue) + (1|sample) + gene, data=dat)
+  bb = lmer(log(value+1) ~ (1|tissue) + (1|sample) + (1 | gene), data=dat)
+  cc = lmer(log(value+1) ~ (1|tissue) + (1|sample), data=dat)
+  anova(bb,cc)
+  return(c(aa,bb,cc))
+}
+
+plotCov = function(master, Prog){
+  dat = master %>% filter(as.character(prog)==Prog & as.character(parent) != as.character(gene)) %>% as.data.frame()
+  aa = ggplot(dat, aes(y=value, x = pos.gene, shape=gene, color=sample)) + geom_point() + xlab("Position") + ylab("TPM")
+  bb = ggplot(dat, aes(y=value, x = gene, fill=sample)) + geom_boxplot() + xlab("Sub-Gene") + ylab("TPM")
+  grid.arrange(aa,bb)
+}
+
+ff = mclapply(1:length(unique(pp$prog)), FUN = varRatio2, mc.cores=3)
+
+ff = as.data.frame(do.call(rbind,ff))
+#100 jobs completes in 1.6 minutes
+
+getStats <- function(df, Theta){
+  full = glmer(value ~ (1|tissue) + (1|sample) + (1 | gene), data=df, family=MASS::negative.binomial(theta=Theta))
+  print(Theta)
+  reduced = glmer(value ~ (1|tissue) + (1|sample), data=df, family=MASS::negative.binomial(theta=Theta))
+  full1 = glmer(value ~ (1|tissue) + (1|sample) + gene, data=df, family=MASS::negative.binomial(theta=Theta))
+  cc = as.data.frame(VarCorr(full))
+  ratio = cc[cc$grp=="gene",4] / sum(cc[,4])
+  print(cc)
+  dd = as.data.frame(anova(full1, reduced))[,-7]
+  colnames(dd)[7] = "pval"
+  dd['varRatio'] = ratio
+  dd['prog'] = df$prog[1]
+  dd['parent'] = df$parent[1]
+  dd['status'] = "Good"
+  dd['source'] = df$source[1]
+  return(dd)
+}
+
+runNB <- function(i){
+  Prog = as.character(unique(pp$prog)[i])
+  df = pp %>% filter(as.character(prog)==Prog & as.character(parent) == as.character(gene)) %>% as.data.frame()
+  Theta = df$disp[1]
+  dat = pp %>% filter(as.character(prog)==Prog & as.character(parent) != as.character(gene)) %>% as.data.frame()
+  results = tryCatch({
+    getStats(dat, Theta)
+  }, warning = function(w) {
+    print(w)
+    rr = getStats(dat, Theta)
+    rr['status'] = "warning"
+    return(rr)
+  }, error = function(e) {
+    errD = cbind(error.df)
+    errD$parent = dat$parent[1]
+    errD$prog = dat$prog[1]
+    errD$source = dat$source[1]
+    return(errD)}) 
+  return(dat)
+}
+
+```
+
+B73 and W22 convert well to PH207, but PH207 does not convert as well to B and W. Genes that fail to convert tend to be a bit longer than the genes that successfully convert. 
+```{r}
+Ccr = ccr %>% group_by(from, to, match) %>% summarise(n = n(), medlen = median(len)) %>% as.data.frame()
+
+ggplot() + geom_point(data=Ccr, aes(x=from, y=n,shape=match,color=to)) + theme_bw()
+
+ggplot(ccr, aes(x=len/1000, y=to , fill=match)) + geom_density_ridges(alpha=0.5) + scale_x_log10() + facet_grid(~from) + xlab("Gene Length (kb)") + ylab("Converted to")
+```
+
+
+SCRAPPED
+```{r}
+sg = rbind(munge(p.counts, p.splits, p.fsplits, oldNames, newNames), munge(b.counts, b.splits, b.fsplits, oldNames, newNames))
+sg = rbind(sg, munge(w.counts, w.splits, w.fsplits, oldNames, newNames))
+
+sg = sg %>% mutate(gene = 
+                       case_when(is.na(as.character(gene)) ~ str_split_fixed(as.character(exon), "_", 2)[,1], TRUE ~ as.character(gene))) %>% as.data.frame()
+
+varRatio = function(gene_df){
+  gene_df$tissue = as.factor(gene_df$tissue)
+  gene_df$sample = as.factor(gene_df$sample)
+  gene_df$rep = as.factor(gene_df$rep)
+  aa = lmer(value ~ tissue + sample + (1 | gene) + (rep | sample), data=gene_df)
+  bb = as.data.frame(VarCorr(aa))
+  ratio = bb[bb$grp=="gene",4] / bb[bb$grp=="Residual",4]
+  return(ratio)
+}
+
+#CALCULATE INTRA-CLASS CORELLATION FOR EACH PARENT WITH CHILDREN AS FACTOR.  HOW MUCH OF VARIANCE IS WITHIN CHILDREN VERSUS BETWEEN. PLOT DISTRIBUTION
+
+ee = sg %>% filter(!is.na(gene), famnum == 1) %>% filter(as.character(parent) != as.character(gene)) %>% group_by(ref, parent) %>% filter(nlevels(gene) > 1) %>%
+summarize(a=nlevels(tissue), b=nlevels(sample), c=nlevels(rep), d = nlevels(gene)) %>% as.data.frame()
+
+dd = sg %>% filter(!is.na(gene), famnum == 1) %>%   filter(as.character(parent) != as.character(gene)) %>% group_by(ref, parent) %>% 
+filter(nlevels(droplevels(gene)) > 1, ref != "BTX_623") %>%
+do(data.frame(. , vRatio = varRatio(.))) %>% as.data.frame()
+
+#SUBSET DATA TO INCLUDE ONLY SIMPLE SCENARIOS: 1 PARENT WITH 1 PROGENY SET (I.E PARENTS WITH FAMNUM==1.  THEN, CHECK OUT: 1 PARENT WITH EQUAL-SIZED PROGENY SETS ACROSS REFERENCES
+
+SG = sg %>% filter(!is.na(gene), famnum == 1) %>%   filter(as.character(parent) != as.character(gene)) %>% group_by(ref, parent) %>% 
+filter(nlevels(droplevels(gene)) > 1, ref != "BTX_623") %>% as.data.frame()
+
+vR = function(df){
+  aa = glmer(value ~ (1|tissue) + (1|sample) + (1 | gene) + (rep | sample), data=df, family=poisson)
+  bb = as.data.frame(VarCorr(aa))
+  ratio = bb[bb$grp=="gene",4] / sum(bb[,4])
+  return(ratio)
+}
+
+SG['comb'] = paste(SG$ref, SG$parent)
+varRatio2 = function(i){
+  dat = SG[SG$comb==unique(SG$comb)[i],]
+  dat$tissue = as.factor(dat$tissue)
+  dat$sample = as.factor(dat$sample)
+  dat$rep = as.factor(dat$rep)
+  ratio = tryCatch({vR(dat)}, warning = function(w) {return(-9)})
+  return(c(ratio, unique(SG$comb)[i]))
+}
+
+ff = mclapply(1:length(unique(SG$comb)), FUN = varRatio2, mc.cores=3)
+
+```
+
+Trimming exons from 
+```{r}
+b = p %>% filter(as.character(parent) != as.character(gene)) %>% group_by(gene) %>% filter(mean(value, na.rm=T) >5) %>% summarize(CV = sd(stdval, na.rm=T)/mean(stdval,na.rm=T), source = min(as.character(source)), parent = min(as.character(parent)))
+b = b %>% mutate(subGene = ifelse(gene %in% minmax$min,"geneA","geneB"))
+
+b = pp %>% filter(as.character(parent) != as.character(gene)) %>% group_by(gene) %>% filter(mean(value, na.rm=T) >0.01) %>% summarize(CV = sd(value, na.rm=T)/mean(value,na.rm=T), source = min(as.character(source)), parent = min(as.character(parent)))
+b = b %>% mutate(subGene = ifelse(gene %in% minmax$min,"geneA","geneB"))
+
+g = dcast(b, parent + source ~subGene, value.var="CV", fun.aggregate=mean)
+r = p %>% filter(as.character(parent) != as.character(gene)) %>% group_by(gene) %>% filter(mean(value, na.rm=T) >5) %>% summarize(mean= mean(value, na.rm=T), median = median(value, na.rm=T), CV = sd(value, na.rm=T)/mean(value,na.rm=T), harm=1/mean(1/value, na.rm=T), source = min(as.character(source)), parent = min(as.character(parent)))
+
+r = p %>% filter(as.character(parent) != as.character(gene)) %>% group_by(parent) %>% filter(mean(value, na.rm=T) >5) %>% spread(subGene, value) %>% as.data.frame()
+```
+
+Adding synteny info
+```{r}
+synt = read.table("~/Documents/Research/MaizeSV/misc/SyntenicGenes_BandP.txt")
+results = read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4.txt", head =T)
+results = results %>% filter(status!="error")
+
+pexon_counts = p %>% filter(sample=="B" & tissue == "A" & rep == "R1" & as.character(gene)!=as.character(parent)) %>% group_by(parent) %>% summarize(n = n(), source=min(as.character(source)), meantpm = mean(value))
+
+meantpms = p %>% filter(as.character(gene)!=as.character(parent)) %>% group_by(parent) %>% summarize(n = n(), source=min(as.character(source)), meantpm = mean(value))
+
+Results = merge(results, pexon_counts, by="parent")
+
+RResults = Results %>% mutate(synt = if_else(source=="fakeMerged",if_else(substr(as.character(parent),1,nchar(as.character(parent))-1) %in% synt$V1,"syntenic","nonsynt"), if_else(parent %in% synt$V1,"syntenic","nonsynt"))) %>% as.data.frame()
+
+
+results1=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.01.txt",header = T)
+results2=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.01_rmvFandL.txt",header = T) #Removing first and last exon of parent gene makes distributions wonky.
+results3=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.05.txt",header = T)
+results4=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.5.txt",header = T)
+
+munge5 = function(df, exon_counts, synteny_key){
+  df = df %>% filter(status!="error" & tissue != "tissue")
+  df = merge(df,exon_counts, by=c("parent","source"))
+  df = df %>% mutate(synt = if_else(source=="fakeMerged",if_else(substr(as.character(parent),1,nchar(as.character(parent))-1) %in% synteny_key$V1,"syntenic","nonsynt"), if_else(parent %in% synteny_key$V1,"syntenic","nonsynt"))) %>% as.data.frame()
+  return(df)
+}
+
+
+Results1 = munge4(results1, pexon_counts, synt)
+Results2 = munge4(results2, pexon_counts, synt)
+Results3 = munge4(results3, pexon_counts, synt)
+Results4 = munge4(results4, pexon_counts, synt)
+
+plot.vr.synt = function(df, merged_quantile, split_quantile){
+  n.counts = as.character(countExceeds(df[df$synt=="nonsynt",], merged_quantile,split_quantile))
+  s.counts = as.character(countExceeds(df[df$synt=="syntenic",], merged_quantile,split_quantile))
+  print(s.counts)
+  print(n.counts)
+  plt = ggplot(df, aes(x=varRatio, fill=source, y=synt)) + geom_density_ridges(alpha=0.5,scale=0.9) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit" & df$synt=="syntenic",]$varRatio, split_quantile,na.rm=T), quantile(df[df$source=="fakeMerged" & df$synt=="syntenic",]$varRatio, merged_quantile, na.rm=T)), linetype = "longdash") + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit"  & df$synt=="nonsynt",]$varRatio, split_quantile, na.rm=T), quantile(df[df$source=="fakeMerged"  & df$synt=="nonsynt",]$varRatio, merged_quantile, na.rm=T)), linetype = "longdash", color="red") + theme_bw() + annotate("text", x = 0.9, y = 1.3, label = paste("Merged =", n.counts[2],"; Split =", n.counts[1])) + annotate("text", x = 0.9, y = 2.4, label = paste("Merged =", s.counts[2],"; Split =", s.counts[1]))
+  return(plt)
+}
+
+plot.vr = function(df, merged_quantile, split_quantile){
+  counts = as.character(countExceeds(df, merged_quantile,split_quantile))
+  plt = ggplot(df, aes(x=varRatio, fill=source)) + geom_density(alpha=0.5) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit",]$varRatio, split_quantile,na.rm=T), quantile(df[df$source=="fakeMerged",]$varRatio, merged_quantile, na.rm=T)), linetype = "longdash") + theme_bw() + annotate("text", x = 0.7, y = 1.3, label = paste("Merged =", counts[2],"; Split =", counts[1]))
+  return(plt)
+}
+
+countExceeds = function(df, merged_quantile, split_quantile){
+  mq = quantile(df[df$source == "fakeMerged",]$varRatio, merged_quantile, na.rm = T)
+  sq = quantile(df[df$source == "fakeSplit",]$varRatio, split_quantile, na.rm = T)
+  counts = df %>% filter(source=="real") %>% mutate(split = ifelse(varRatio > sq, 1,0), merged = ifelse(varRatio < mq, 1, 0)) %>% summarize(splits = sum(split,na.rm=T), mergeds = sum(merged,na.rm=T))
+  return(counts)
+}
+
+
+plot.vr.synt(Results3,0.1,0.9)
+plot.vr.synt(Results4,0.1,0.9)
+
+plot.vr.exon.synt = function(df, min_exon_count, max_exon_count){
+  plt = ggplot(df[df$n > min_exon_count & df$n < max_exon_count,], aes(x=varRatio, fill=source, y=synt)) + geom_density_ridges(alpha=0.5,scale=0.9)+facet_grid(~n)
+  return(plt)
+}
+
+plot.vr.exon.synt(Results1,10,20)
+plot.vr.exon.synt(Results2,10,20)
+plot.vr.exon.synt(Results3,10,20)
+plot.vr.exon.synt(Results4,10,20)
+
+ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
+
+ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
+ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
+
+ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
+
+#For two PH207 genes to be potentially merged into 1 W22 gene, compare to PH207 fakeMerge.  what is null distribution if we would randomly put two adjacent PH207 genes together?
+#What about combining this metric with the alternative?
+#For the same prog set as above, if we have 2P -> 1W, but mapped to W22, compare to W22 fakeSplits?
+#How would you combine?
+results1 = results1 %>% mutate(phsplit=ifelse(source=="fakeMerged", FALSE, str_detect(parent, "^Zm00008")))
+results1[results1$source=="fakeSplit",]$phmerged=FALSE
+
+```
+
+
+```{r}
+ggplot()+geom_point(aes(x=c(0.05,0.01),y=c(0,0), size=0.5))+geom_density(data=pp,aes(x=value,fill=source),alpha=0.5)+scale_x_log10()
+ggplot()+geom_point(aes(x=c(0.05,0.01,0.1,0.5),y=c(0,0,0,0), size=0.5))+geom_density(data=RResults1,aes(x=meantpm,fill=source),alpha=0.5)+scale_x_log10()+xlab("Mean TPM")+ylab("")
+
+ggplot(Results4[Results4$n<10,],aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+facet_grid(~n)
+ggplot(Results4[Results4$n>10 & Results4$n<20,],aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+facet_grid(~n)
+```
+
+Exploring dual filtering of minTPM and propLow
+```{r}
+results = read.table("~/Documents/Research/Split_genes/data/PH207_splitGenes_m4_exons_TPMdualfilt.txt",head=T)
+results2 = read.table("~/Documents/Research/Split_genes/data/PH207_splitGenes_m4_exons_ResVar2.txt",head=T)
+
+ggplot(results[results$minTPM==0.1 & results$propThresh==0.67,], aes(x=varRatio,fill=source))+geom_density(alpha=0.5)
+
+results = results %>% mutate(phsplit=ifelse(source=="fakeMerged", FALSE, str_detect(parent, "^Zm00008")))
+
+plot.vr.synt.2 = function(df, merged_quantile, split_quantile){
+  n.m.counts = as.character(countExceeds(df[df$synt=="nonsynt" & df$phsplit==FALSE,], merged_quantile,split_quantile))
+  n.s.counts = as.character(countExceeds(df[df$synt=="nonsynt" & df$phsplit==TRUE,], merged_quantile,split_quantile))
+  s.m.counts = as.character(countExceeds(df[df$synt=="syntenic" & df$phsplit==FALSE,], merged_quantile,split_quantile))
+  s.s.counts = as.character(countExceeds(df[df$synt=="syntenic" & df$phsplit==TRUE,], merged_quantile,split_quantile))
+  plt = ggplot(df, aes(x=varRatio, fill=source, y=synt)) + geom_density_ridges(alpha=0.5,scale=0.9) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit",]$varRatio, split_quantile), quantile(df[df$source=="fakeMerged",]$varRatio, merged_quantile)), linetype = "longdash") + facet_grid(~phsplit) + theme_bw() + annotate("text", x = 0.7, y = 1.3, label = paste("Merged =", n.m.counts[2],"; Split =", n.s.counts[1])) + annotate("text", x = 0.7, y = 2.4, label = paste("Merged =", s.m.counts[2],"; Split =", s.s.counts[1]))
+  return(plt)
+}
+
+Results = munge5(results, pexon_counts, synt)
+RR = Results %>% group_by(minTPM,propThresh,source) %>% summarize(meanVR = mean(varRatio,na.rm=T))
+Results['id']=paste(Results$minTPM,Results$propThresh)
+
+Results2 = munge5(results2, pexon_counts, synt)
+RR2 = Results2 %>% group_by(minTPM,propThresh,source) %>% summarize(meanVR = mean(varRatio,na.rm=T))
+Results2['id']=paste(Results2$minTPM,Results2$propThresh)
+
+
+
+
+
+plot.expression = function(df, DF, parent_id, name){
+  
+  vR = DF[DF$parent==parent_id,]$varRatio[1]
+  df1 = df[df$parent==parent_id,]
+  genes = unique(df1$gene)
+  df2 = df1[df1$gene==genes[1],]
+  place = max(df2$pos.exon) - min(df2$pos.exon) / 2
+  print(max(df2$pos.exon))
+  print(min(df2$pos.exon))
+  print(place)
+  ann_text <- data.frame(value = max(df1$value/df1$basepairs) * 0.9, pos.exon = min(df2$pos.exon) + place, lab = "varRatio", tissue = "Em",gene=genes[1], sample="W")
+  ggplot(df1,aes(x=pos.exon/1000, y=value/basepairs, shape=sample, color = tissue))+geom_point(size=2, position=position_dodge(width=0.1)) + geom_hline(data = df1, aes(yintercept=mean(value/basepairs)), linetype="dashed") + facet_wrap(~gene, scales="free_x") + xlab("Position (kb)") + ylab("Reads per kb") + geom_text(data = ann_text, aes(x=pos.exon/1000,y=value,label = paste("varRatio =", round(vR,3))))
+  ggsave(paste(parent_id,name,".pdf"), plot = last_plot(), device = pdf(), path = "~/Documents/Research/Split_genes/",
+  scale = 1,
+  dpi = 300, limitsize = TRUE)
+  dev.off()
+}
+
+plot.expression = function(df, DF, parent_id, name){
+  vR = DF[DF$parent==parent_id,]$varRatio[1]
+  df1 = df[df$parent==parent_id,]
+  ggplot(df1, aes(x = pos.exon/1000, y = value/basepairs, shape = sample, color = tissue))+geom_point(size = 2, position=position_dodge(width = 0.1)) + geom_hline(data =  df1, aes(yintercept = mean(value / basepairs)), linetype="dashed") + facet_wrap(~gene, scales="free_x") + xlab("Position (kb)") + ylab("Reads per kb") 
+  ggsave(paste(parent_id,name,".png",sep=""), height=5, width=7, unit="in",plot = last_plot(), device = png(), path = "~/Documents/Research/Split_genes/",
+  scale = 1,
+  dpi = 300, limitsize = TRUE)
+  dev.off()
+}
+
+Results2 = Results2 %>% group_by(minTPM, propThresh, source) %>% mutate(case = ifelse(varRatio > 0.9, "high", ifelse(varRatio < 0.1, "low", ifelse(abs(varRatio - 0.5) < 0.1, "mid", "none")))) %>% as.data.frame()
+
+Results %<>% group_by(source) %>% mutate(case = ifelse(varRatio > 0.9, "high", ifelse(varRatio < 0.1, "low", ifelse(abs(varRatio - 0.5) < 0.1, "mid", "none")))) %>% as.data.frame()
+
+dd = Results2 %>% filter(minTPM==0.05 & propThresh==0.25 & source=="fakeMerged" & case=="low") %>% select(parent, tissue, gene, sample, Residual) %>% as.data.frame()
+
+tmp = Results2 %>% filter(source!="real" & case!="none") %>% group_by(source,case) %>% filter(minTPM=="0.5" & propThresh==0.5) %>%  select(parent, tissue, gene, sample, Residual, case, source) %>% as.data.frame()
+
+Results2 %>% filter(source!="real" & case!="none") %>% filter(minTPM=="0.5" & propThresh==0.5) %>%  select(parent, tissue, gene, sample, Residual, case, source) %>% group_by(source,case) %>%  do(plotCases(.,II,20,paste(first(.$source), first(.$case),sep="")))
+
+Results %>% filter(source!="real" & case!="none") %>% select(parent, tissue, gene, sample, Residual, case, source) %>% group_by(source,case) %>%  do(plotCases(.,II,20,paste(first(.$source), first(.$case),sep="")))
+
+
+
+plotCases = function(DF, df, num_cases, Name){
+  DF = DF %>% sample_n(num_cases) %>% droplevels() %>% as.data.frame()
+  print(str(melt(DF,id.var=c("parent", "case", "source"))))
+  DF.m = melt(DF,id.var=c("parent", "case", "source")) %>% group_by(parent) %>% mutate(tot=sum(value)) %>% ungroup() %>% as.data.frame()
+  print(str(DF))
+  print(num_cases)
+  print(str(DF.m))
+  ggplot(DF.m, aes(x=parent,y=value/tot,fill=variable)) + geom_col() + theme(axis.text.x = element_text(angle = 45, hjust=1))
+  ggsave(paste(Name,".png", sep=""), height=5, width=7, unit="in",plot = last_plot(), device = png(), path = "~/Documents/Research/Split_genes/",
+  scale = 1,
+  dpi = 300, limitsize = TRUE)
+  dev.off()
+  print(paste(Name,".png", sep=""))
+  for (i in 1:nrow(DF)){
+    par = as.character(DF[i,]$parent)
+    plot.expression(df, DF, par, Name)
+  }
+}
+
+plotCases(tmp[tmp$source=="fakeMerged" & tmp$case=="low",], II, 20, "fakeMerge_Low")
+
+for (i in 1:nrow(jj)){
+par = as.character(jj[i,]$parent)
+Name = as.character(jj[i,]$source)
+print(paste(par,Name))
+plot.expression(II, Results, par, Name)
+}
+
+
+
+#Still need to filter tissues with low expression
+#Maybe handle expressed/non-expressed subGene situations differently.
+#with the log fold changes you will get inflated values when denominator is super small
+
+# fake merge is mixture of background expression and non background expression
+# fake Split is mixture of genes with truncated isoforms and single/interspersed isoforms
+
+# jkl = pp %>% group_by(parent, prog, source, sample, rep, tissue) %>% filter(sample=="P" & value>0.01) %>% summarize(m2f = getAvgLog(value)) %>% ungroup(sample,rep) %>%  mutate(badtissue=ifelse(median(value) < 0.05, 1, 0)) %>% filter(badtissue==0) %>% ungroup(sample,rep,tissue) %>% summarize(M2f=mean(m2f))
+
+
+
+```
+
+
+Begin exploring mean two-fold coverage
+```{r}
+b.splits = read.table("~/Documents/Research/Split_genes/input/B73_LT_HTseq_splitGene_key.txt")
+b.fsplits = read.table("~/Documents/Research/Split_genes/input/B73_splitGenes_fake_m4.txt")
+b.counts=read.table("~/Documents/Research/Split_genes/input/Samples_LT_B73_Ref_HTseq.txt", head=T)
+w.splits = read.table("~/Documents/Research/Split_genes/input/W22_LT_HTseq_splitGene_key.txt")
+w.fsplits = read.table("~/Documents/Research/Split_genes/input/W22_splitGenes_fake_m4.txt")
+w.counts=read.table("~/Documents/Research/Split_genes/input/Samples_LT_W22_Ref_HTseq.txt", head=T)
+p.splits = read.table("~/Documents/Research/Split_genes/input/PH207_LT_HTseq_splitGene_key.txt")
+p.fsplits = read.table("~/Documents/Research/Split_genes/input/PH207_splitGenes_fake_m4.txt")
+p.counts = read.table("~/Documents/Research/Split_genes/input/Samples_LT_PH207_Ref_HTseq.txt", head=T)
+
+synt = read.table("~/Documents/Research/MaizeSV/misc/SyntenicGenes_BandP.txt")
+
+getAvgLog = function(v, verbose=F){
+  vm = matrix(v, nrow = length(v), ncol = length(v))
+  svm = sweep(vm, 2, v, FUN = "/")
+  lt = abs(log(svm[lower.tri(svm)], 2))
+  ut = abs(log(svm[upper.tri(svm)], 2))
+  m2f = mean(c(lt,ut))
+  if (verbose==TRUE){
+    print(vm)
+    print(svm)
+    print(lt)
+    print(ut)
+    print(m2f)
+  }
+  return(m2f)
+}
+
+countExceeds2 = function(df, merged_quantile, split_quantile){
+  mq = quantile(df[df$source == "fakeMerged",]$M2f, merged_quantile, na.rm = T)
+  sq = quantile(df[df$source == "fakeSplit",]$M2f, split_quantile, na.rm = T)
+  print(sq)
+  print(mq)
+  counts = df %>% filter(source=="real") %>% mutate(split = ifelse(M2f > sq, 1,0), merged = ifelse(M2f < mq, 1, 0)) 
+  
+  splits = sum(counts$split, na.rm=T)
+  mergeds = sum(counts$merged,na.rm=T)
+  # %>% summarize(splits = sum(split,na.rm=T), mergeds = sum(merged,na.rm=T))
+  return(c(splits,mergeds))
+}
+
+plot.m2f = function(df, merged_quantile, split_quantile){
+    counts = as.character(countExceeds2(df, merged_quantile,split_quantile))
+    plt = ggplot(df, aes(x=M2f, fill=source)) + geom_density(alpha=0.5) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit",]$M2f, split_quantile,na.rm=T), quantile(df[df$source=="fakeMerged",]$M2f, merged_quantile, na.rm=T)), linetype = "longdash") + theme_bw() + annotate("text", x = 0.5, y = 1.3, label = paste("Merge =", counts[2],"\nSplit =", counts[1]))
+    return(plt)
+}
+
+plot.m2f.synt = function(df, merged_quantile, split_quantile){
+  n.counts = as.character(countExceeds2(df[df$synt=="nonsynt",], merged_quantile,split_quantile))
+  s.counts = as.character(countExceeds2(df[df$synt=="syntenic",], merged_quantile,split_quantile))
+  plt = ggplot(df, aes(x=M2f, fill=source, y=synt)) + geom_density_ridges(alpha=0.5,scale=0.9) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit" & df$synt=="syntenic",]$M2f, split_quantile,na.rm=T), quantile(df[df$source=="fakeMerged" & df$synt=="syntenic",]$M2f, merged_quantile, na.rm=T)), linetype = "longdash") + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit" & df$synt=="nonsynt",]$M2f, split_quantile, na.rm=T), quantile(df[df$source=="fakeMerged" & df$synt=="nonsynt",]$M2f, merged_quantile, na.rm=T)), linetype = "longdash", color="red") + scale_x_log10() + theme_bw() + annotate("text", x = 45.9, y = 1.3, label = paste("Merged =", n.counts[2],"; Split =", n.counts[1])) + annotate("text", x = 1.9, y = 1.4, label = paste("Merged =", s.counts[2],"; Split =", s.counts[1]))
+  return(plt)
+}
+
+convertFactors = function(df){
+  df$tissue = as.factor(df$tissue)
+  df$sample = as.factor(df$sample)
+  df$rep = as.factor(df$rep)
+  df$gene = as.factor(df$gene)
+  return(df)
+}
+
+parseName = function(df){
+  df = df %>% mutate(ref = str_split_fixed(as.character(variable), "_", 3)[,3], sample = str_split_fixed(as.character(variable), "[.]", 3)[,1], tissue = str_split_fixed(as.character(variable), "[.]", 3)[,2], rep = str_split_fixed(as.character(variable), "[.]", 3)[,3]) %>% mutate(rep = str_split_fixed(as.character(rep),"_",3)[,1]) %>% as.data.frame()
+  return(df)
+}
+
+munge = function(df, melt_by){
+  d.m = melt(df, id.vars = melt_by)
+  d.n = parseName(d.m)
+  d.n = convertFactors(d.n)
+  return(d.n)
+}
+
+formatData = function(counts,splits,fsplits, minTPM, sampleID, nameChange=T){
+  if (nameChange==T){
+  oldNames = c("V1","V2","V3","V4","V5","V6","V7","V8","V9","V10") 
+  newNames = c("exon","chrom","pos.exon","end.exon","gene","pos.gene","end.gene","parent","prog","famnum")
+  setnames(splits, old = oldNames, new = newNames)
+  setnames(fsplits, old = c(oldNames,"V11"), new = c(newNames, "source"))
+  setnames(counts, old = c("Genes"), new = c("exon"))
+  }
+  splits['source']="real"
+  
+  print("Munging...")
+  splits = rbind(splits, fsplits)
+  d = merge(splits, counts, by = c("exon"), all.y=TRUE)
+  p = munge(d, c("exon","chrom" ,"pos.exon","end.exon","gene","pos.gene","end.gene","parent","prog","famnum", "source"))
+  p %<>% filter(!exon %in% c("__alignment_not_unique", "__ambiguous", "__no_feature", "__not_aligned", "__too_low_aQual", "__alignment_not_unique") & sample == sampleID) %>% as.data.frame()
+  print("Munging...done")
+  
+  print("Calculating TPM...")
+  p['basepairs'] = abs(p$end.exon - p$pos.exon)
+  nse = dcast(p, exon + gene + parent + prog + basepairs + pos.gene + end.gene + pos.exon + end.exon + famnum + source ~ variable, value.var = "value")
+  
+  nse = nse[nse$basepairs>50,]
+  nse=nse[!is.na(nse$basepairs),]
+  nse['rowid'] = paste(nse$exon, nse$prog, nse$gene, nse$parent)
+  row.names(nse) = nse$rowid
+  tpm_e = as.data.frame(counts_to_tpm(nse[,12:31], nse$basepairs, c(rep(50,20))))
+  tpm_e = rownames_to_column(tpm_e, var = "rowid")
+  ww = merge(tpm_e, nse[,c("exon","gene","parent","prog","basepairs","pos.gene","end.gene","pos.exon","end.exon","famnum","source","rowid")], by="rowid", all.x=T)
+  print("Done calculating TPM...")
+  # print(head(ww))
+# NEEDS TO REQUIRE X NUMBER OF TISSUES...OUTLIERS IN FAKESPLITS GENERATED BY SINGLE TISSUE OBSERVATIONS...does it really?
+  print("Re-munging...")
+  pp = munge(ww, c("exon","gene","parent","prog", "famnum", "source","pos.exon","end.exon","rowid","basepairs","pos.gene","end.gene"))
+  PP = pp %>% group_by(gene,tissue,sample,rep, source,parent,prog,pos.gene,end.gene) %>% summarize(value = mean(value)) %>% as.data.frame()
+  #Filter genes that are not expressed and label parents
+  PP %<>% group_by(parent, prog, tissue) %>% filter(mean(value) > minTPM) %>% ungroup() %>% group_by(parent, prog, tissue) %>% filter(length(unique(as.character(gene))) > 2) %>% ungroup() %>% mutate(isParent = ifelse(as.character(gene) == as.character(parent), TRUE, FALSE)) %>%  as.data.frame()
+  print("Re-munging...done")
+  
+return(PP)
+}
+
+
+calcM2f = function(df, offset, sampleID){
+  df$value = df$value + offset
+  DF = df %>% filter(isParent == FALSE & sample == sampleID) %>% group_by(parent, prog, source, sample, rep, tissue) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent,prog,source) %>% summarize(M2f=mean(m2f,na.rm=T),numTiss=length(unique(as.character(tissue))))
+  DF %<>% filter(M2f!=0) %>% as.data.frame()
+  return(DF)
+}
+  
+munge6 = function(df, synteny_key){
+  df = df %>% mutate(synt = if_else(source == "fakeMerged", if_else(substr(as.character(parent), 1, nchar(as.character(parent)) - 1) %in% synteny_key$V1,"syntenic","nonsynt"), if_else(parent %in% synteny_key$V1,"syntenic","nonsynt"))) %>% as.data.frame()
+  return(df)
+}
+
+plot.expression = function(df, parent_id, name, save=F){
+  df1 = df[df$parent==parent_id,]
+  aa = ggplot(df1, aes(x = pos.gene/1000, y = value, shape = sample, color = tissue))+geom_point(size = 2, position=position_dodge(width = 0.1)) + geom_hline(data =  df1, aes(yintercept = mean(value)), linetype="dashed") + facet_wrap(~gene, scales="free_x") + xlab("Position (kb)") + ylab("Reads per kb")
+  if (save==TRUE){
+  ggsave(paste(parent_id,name,".png",sep=""), height=5, width=7, unit="in",plot = last_plot(), device = png(), path = "~/Documents/Research/Split_genes/",
+  scale = 1,
+  dpi = 300, limitsize = TRUE)
+  dev.off()
+  }
+  return(aa)
+}
+
+labelExceeds2 = function(df, merged_quantile, split_quantile){
+  mq = quantile(df[df$source == "fakeMerged",]$M2f, merged_quantile, na.rm = T)
+  sq = quantile(df[df$source == "fakeSplit",]$M2f, split_quantile, na.rm = T)
+  df %<>% filter(source=="real") %>% mutate(Output_call = ifelse(M2f > sq, "SPLIT", ifelse(M2f < mq, "MERGED", "NOCALL"))) %>% as.data.frame() 
+  return(df)
+}
+
+pp = formatData(p.counts, p.splits, p.fsplits, -0.1, "P", nameChange=F)
+ww = formatData(w.counts, w.splits, w.fsplits, -0.1, "W", nameChange=F)
+bb = formatData(b.counts, b.splits, b.fsplits, -0.1, "B", nameChange=F)
+
+P.r = calcM2f(pp, 0.001, "P")
+B.r = calcM2f(bb, 0.001, "B")
+W.r = calcM2f(ww, 0.001, "W")
+
+plot.m2f(P.r, 0.1, 0.9)
+plot.m2f(W.r, 0.1, 0.9)
+plot.m2f(B.r, 0.1, 0.9)
+
+PP.r = labelExceeds2(P.r, 0.17, 0.8)
+WW.r = labelExceeds2(W.r, 0.17, 0.8)
+BB.r = labelExceeds2(B.r, 0.17, 0.8)
+
+#JM's golden truth set based on blasting to A. thaliana
+AT = read.table("~/Documents/Research/Split_genes/Blast_Comparisons/all_filt.txt",head=T)
+
+P.AT = AT %>% filter(Output_call %in% c("SPLIT", "MERGED") & parent %in% PP.r$parent) %>% select(parent, Call, Output_call)
+W.AT = AT %>% filter(Output_call %in% c("SPLIT", "MERGED") & parent %in% WW.r$parent) %>% select(parent, Call, Output_call)
+B.AT = AT %>% filter(Output_call %in% c("SPLIT", "MERGED") & parent %in% BB.r$parent) %>% select(parent, Call, Output_call)
+
+P.AT = merge(P.AT, PP.r, by = "parent", all.x=T)
+B.AT = merge(B.AT, BB.r, by = "parent", all.x=T)
+W.AT = merge(W.AT, WW.r, by = "parent", all.x=T)
+
+W.AT %<>% filter(!duplicated(prog) & M2f!="NA") %>% mutate(match = ifelse(Output_call.x==Output_call.y, 1, 0))
+P.AT %<>% filter(!duplicated(prog) & M2f!="NA") %>% mutate(match = ifelse(Output_call.x==Output_call.y, 1, 0))
+B.AT %<>% filter(!duplicated(prog) & M2f!="NA") %>% mutate(match = ifelse(Output_call.x==Output_call.y, 1, 0))
+
+B.Dis = B.AT %>% filter(match==0) %>% as.data.frame()
+W.Dis = W.AT %>% filter(match==0) %>% as.data.frame()
+P.Dis = P.AT %>% filter(match==0) %>% as.data.frame()
+
+
+for (i in 1:nrow(P.Dis)){
+par = as.character(P.Dis[i,]$parent)
+Name = paste(P.Dis[i,]$Output_call.x, P.Dis[i,]$Output_call.y, "Dis.P")
+print(paste(par,Name))
+plot.expression(PP, par, Name, save=T)
+}
+
+```
+
+OLD
+```{r}
+# p.r = pp %>% group_by(parent, prog, source, tissue) %>% filter(sample=="P") %>%  mutate(badtissue=ifelse(median(value) < 0.05, 1, 0)) %>% ungroup() %>% group_by(parent, prog, source, sample, rep, tissue) %>% filter(value>0.01 & badtissue==0) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent,prog,source) %>% summarize(M2f=mean(m2f,na.rm=T))
+
+# w.r = ww %>% group_by(parent, prog, source, tissue) %>% filter(sample=="W") %>%  mutate(badtissue=ifelse(median(value) < 0.05, 1, 0)) %>% ungroup() %>% group_by(parent, prog, source, sample, rep, tissue) %>% filter(value>0.01 & badtissue==0) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent,prog,source) %>% summarize(M2f=mean(m2f,na.rm=T))
+
+# b.r = bb %>% group_by(parent, prog, source, tissue) %>% filter(sample=="B") %>%  mutate(badtissue=ifelse(median(value) < 0.05, 1, 0)) %>% ungroup() %>% group_by(parent, prog, source, sample, rep, tissue) %>% filter(value>0.01 & badtissue==0) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent,prog,source) %>% summarize(M2f=mean(m2f,na.rm=T))
+
+
+p.meantpms = pp %>% filter(as.character(gene)!=as.character(parent)) %>% group_by(parent) %>% summarize(n = n(), source=min(as.character(source)), meantpm = mean(value))
+w.meantpms = ww %>% filter(as.character(gene)!=as.character(parent)) %>% group_by(parent) %>% summarize(n = n(), source=min(as.character(source)), meantpm = mean(value))
+b.meantpms = bb %>% filter(as.character(gene)!=as.character(parent)) %>% group_by(parent) %>% summarize(n = n(), source=min(as.character(source)), meantpm = mean(value))
+
+B.r = merge(b.r, b.meantpms, by = c('parent', 'source'))
+
+B.r = BB %>% group_by(parent, prog, source, tissue) %>% filter(sample=="B") %>%  mutate(badtissue=ifelse(median(value) < 0.002, 1, 0)) %>% ungroup() %>% group_by(parent, prog, source, sample, rep, tissue) %>% filter(badtissue==0) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent,prog,source) %>% summarize(M2f=mean(m2f,na.rm=T))
+
+W.r = WW %>% group_by(parent, prog, source, tissue) %>% filter(sample=="W") %>%  mutate(badtissue=ifelse(median(value) < 0.002, 1, 0)) %>% ungroup() %>% group_by(parent, prog, source, sample, rep, tissue) %>% filter(badtissue==0) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent,prog,source) %>% summarize(M2f=mean(m2f,na.rm=T))
+
+```
+

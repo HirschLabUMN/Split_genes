@@ -15,12 +15,16 @@ require(stringr)
 require(lme4)
 require(inline)
 require(tibble)
+require(edgeR)
 
 outfile = args[4]
 outfile2 = args[5]
 counts = read.table(args[1], head=T)
 splits = read.table(args[2])
 fsplits = read.table(args[3])
+minTpm = args[6] #Threshold for low TPM
+propFilt = args[7] #filter exons based on TPM for genes with less than this proportion of exons with low TPM
+samp_names = as.character(c(args[8:length(args)]))
 
 oldNames = c("V1","V2","V3","V4","V5","V6","V7","V8","V9","V10") 
 newNames = c("exon","chrom","pos.exon","end.exon","gene","pos.gene","end.gene","parent","prog","famnum")
@@ -37,7 +41,7 @@ getStats <- function(df, Theta){
   full = glmer(value ~ (1|tissue) + (1|sample) + (1 | gene), data=df, family=MASS::negative.binomial(theta=Theta))
   reduced = glmer(value ~ (1|tissue) + (1|sample), data=df, family=MASS::negative.binomial(theta=Theta))
   cc = as.data.frame(VarCorr(full))
-  ratio = cc[cc$grp=="gene",4] / sum(cc[,4])
+  geneVar = cc[cc$grp=="gene",4] / sum(cc[,4])
   dd = as.data.frame(anova(full, reduced))[,-7]
   colnames(dd)[7] = "pval"
   dd['varRatio'] = ratio
@@ -45,6 +49,7 @@ getStats <- function(df, Theta){
   dd['parent'] = df$parent[1]
   dd['status'] = "Good"
   dd['source'] = df$source[1]
+  dd=cbind(dd,as.data.frame(t(cc[,c(1,4)])))
   return(dd)
 }
 
@@ -72,6 +77,7 @@ runNB <- function(i){
 runLMM <- function(i){
   Prog = as.character(unique(pp$prog)[i])
   dat = pp %>% filter(as.character(prog)==Prog & as.character(parent) != as.character(gene)) %>% as.data.frame()
+  err.num=0
   results = tryCatch({
     getStatsLMM(dat)
   }, warning = function(w) {
@@ -80,11 +86,13 @@ runLMM <- function(i){
     rr['status'] = "warning"
     return(rr)
   }, error = function(e) {
-    errD = cbind(error.df)
-    errD$parent = dat$parent[1]
-    errD$prog = dat$prog[1]
-    errD$source = dat$source[1]
-    return(errD)}) 
+    print(e)
+    err.num = err.num + 1
+    print(err.num)
+    # errD$parent = dat$parent[1]
+    # errD$prog = dat$prog[1]
+    # errD$source = dat$source[1]
+    return(-9)}) 
   return(results)
 }
 
@@ -92,7 +100,7 @@ getStatsLMM <- function(df, Theta){
   full = lmer(log(value+1) ~ (1|tissue) + (1|sample) + (1 | gene), data=df)
   reduced = lmer(log(value+1) ~ (1|tissue) + (1|sample), data=df)
   cc = as.data.frame(VarCorr(full))
-  ratio = cc[cc$grp=="gene",4] / sum(cc[,4])
+  ratio = cc[cc$grp=="gene", 4] / (cc[cc$grp=="Residual", 4] + cc[cc$grp=="gene", 4])
   dd = as.data.frame(anova(full, reduced))[,-7]
   colnames(dd)[7] = "pval"
   dd['varRatio'] = ratio
@@ -100,6 +108,7 @@ getStatsLMM <- function(df, Theta){
   dd['parent'] = df$parent[1]
   dd['status'] = "Good"
   dd['source'] = df$source[1]
+  dd = cbind(dd,as.data.frame(t(cc[,c(1,4)])))
   return(dd)
 }
 
@@ -146,6 +155,17 @@ munge3 = function(tpm_exons){
   return(d.n)
 }
 
+munge4 = function(tpm_exons){
+  d.m = melt(tpm_exons, id.vars = c("exon","gene","parent","prog", "famnum", "source","pos.exon","end.exon","rowid","basepairs","pos.gene","end.gene"))
+  d.n = d.m %>% mutate(ref = str_split_fixed(as.character(variable), "_", 3)[,3], sample = str_split_fixed(as.character(variable), "[.]", 3)[,1], tissue = str_split_fixed(as.character(variable), "[.]", 3)[,2], rep = str_split_fixed(as.character(variable), "[.]", 3)[,3]) %>% mutate(rep = str_split_fixed(as.character(rep),"_",3)[,1]) %>% as.data.frame()
+  d.n$tissue = as.factor(d.n$tissue)
+  d.n$sample = as.factor(d.n$sample)
+  d.n$rep = as.factor(d.n$rep)
+  d.n$gene = as.factor(d.n$gene)
+  d.n = d.n %>% filter(nlevels(droplevels(gene)) > 1 & source != "unchanged") %>% as.data.frame()
+  d.n = d.n %>% group_by(gene,tissue,sample,rep, source,parent,prog,pos.gene,end.gene) %>% summarize(value = mean(value)) %>% as.data.frame()
+  return(d.n)
+}
 counts_to_tpm <- function(counts, featureLength, meanFragmentLength) {
   
   # Ensure valid arguments.
@@ -207,18 +227,28 @@ coldata = data.frame(row.names = nn, geno = mm, tissue = tt, rep = rr)
 
 # tpm = as.data.frame(counts_to_tpm(nsg[,4:63],nsg$basepairs, c(rep(50,60))))
 
-nse = dcast(p, exon + gene + parent + prog + basepairs + pos.gene + end.gene + pos.exon + end.exon + famnum + source ~ variable, value.var = "value")
+p['rpk'] = p$value / p$basepairs
+nse = dcast(p, exon + gene + parent + prog + basepairs + pos.gene + end.gene + pos.exon + end.exon + famnum + source ~ variable, value.var = "rpk")
+
 nse = nse[nse$basepairs>50,]
 nse=nse[!is.na(nse$basepairs),]
 nse['rowid'] = paste(nse$exon, nse$prog, nse$gene, nse$parent)
 row.names(nse) = nse$rowid
+
+# Attempt at GeTMM
+# y=DGEList(counts=nse[,12:71])
+# keep <- rowSums(cpm(y)>1) >= 2
+# y <- y[keep, , keep.lib.sizes=FALSE]
+# y = calcNormFactors(y)
+# tpm_e = cpm(y)
+
 tpm_e = as.data.frame(counts_to_tpm(nse[,12:71], nse$basepairs, c(rep(50,60))))
-print(nse)
-# qq = p %>% group_by(gene, parent, prog) %>% summarize(pos.gene = min(pos.exon), end.gene = max(end.exon), famnum=min(famnum), source = min(source)) %>% as.data.frame()
 
-# tpm = rownames_to_column(tpm, var = "gene")
+# # qq = p %>% group_by(gene, parent, prog) %>% summarize(pos.gene = min(pos.exon), end.gene = max(end.exon), famnum=min(famnum), source = min(source)) %>% as.data.frame()
+# 
+# # tpm = rownames_to_column(tpm, var = "gene")
 tpm_e = rownames_to_column(tpm_e, var = "rowid")
-
+# 
 print(head(tpm_e))
 # ww = merge(tpm, qq, by=c("gene"), all.x=T)
 ww = merge(tpm_e, nse[,c("exon","gene","parent","prog","basepairs","pos.gene","end.gene","pos.exon","end.exon","famnum","source","rowid")], by="rowid", all.x=T)
@@ -226,25 +256,29 @@ ww = merge(tpm_e, nse[,c("exon","gene","parent","prog","basepairs","pos.gene","e
 print(head(ww))
 print("Re-munging...")
 # pp = munge2(ww)
-pp = munge3(ww)
+# pp = munge3(ww) # Turn on for exons
+pp = munge4(ww)
 print("Re-munging...done")
 print(head(pp))
 
-# Filters?
-#   exons minimum tpm 
-#   expressed in minimum number of tissues
-#   
-#   plot varRatio versus mean tpm
-#   filter genes with huge CV??
-#   
-#   
-pp = pp %>% group_by(exon) %>% filter(mean(value)>0.01) %>% as.data.frame()
-pp = pp %>% group_by(parent) %>% filter(end.exon==max(end.exon) | pos.exon==min(pos.exon)) %>% as.data.frame()
+# pp = pp %>% group_by(exon) %>% mutate(lowtpm = ifelse(median(value) < minTpm, 1, 0)) %>% group_by(gene) %>% mutate(propLow=sum(lowtpm)/n()) %>% as.data.frame()
+# 
+# pp = pp %>% group_by(exon) %>% filter(!(propLow <= propFilt & lowtpm == 1)) %>% as.data.frame()
 
-# throw out first and last exon??
-# print("Merging dispersion estimates...")
-# pp = merge(ee, disp, by=c("gene"), all.x = TRUE)
-# print("Merging dispersion estimates...done")
+pp %<>% group_by(gene) %>% mutate(lowtpm = ifelse(median(value) < minTpm, 1, 0)) %>% group_by(gene) %>% mutate(propLow=1) %>% as.data.frame()
+
+pp = pp %>% group_by(gene) %>% filter(!(propLow <= propFilt & lowtpm == 1)) %>% as.data.frame()
+
+pp %<>% filter(sample %in% samp_names) %>% as.data.frame()
+
+#Only filter low TPM exons if it doesn't wipe the gene out??  Or if propLow is a certain treshhold?  Or only filter low TPM exons if avg TPM is certain distance from avg exon-TPM for the gene.
+
+# pp = pp %>% group_by(parent) %>% filter(end.exon==max(end.exon) | pos.exon==min(pos.exon)) %>% as.data.frame()
+
+# rj= pp %>% group_by(exon) %>% filter((propLow <= propFilt & lowtpm == 1)) %>% as.data.frame()
+# 
+# RJ = pp %>% filter(as.character(prog) %in% rj$prog) %>% as.data.frame()
+
 
 print("Filtering for valid progeny sets...")
 # pp = pp %>% filter(disp != 60) %>% as.data.frame() ## FILTER FOR GENES WITH DISPERSION ==60; MEANS VERY LOW COUNTS
@@ -273,10 +307,16 @@ for (i in 1:(length(unique(pp$prog))/10)){
   j = i * 10
   progress = round(i/(length(unique(pp$prog))/10), digits = 4) * 100
   print(paste0("Running jobs: ", j - 9, "-", j, "; (", progress, "% complete)"))
-  ff = mclapply((j - 9):j, FUN = runLMM, mc.cores=2)
+  ff = mclapply((j - 9):j, FUN = runLMM, mc.cores=10)
   wait()
   ff = as.data.frame(do.call(rbind,ff))
   results = rbind(results, ff)
 }
 
 write.table(results, outfile, row.names = F, quote=F)
+
+
+
+# print("Merging dispersion estimates...")
+# pp = merge(ee, disp, by=c("gene"), all.x = TRUE)
+# print("Merging dispersion estimates...done")
