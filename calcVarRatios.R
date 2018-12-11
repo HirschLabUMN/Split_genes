@@ -166,6 +166,7 @@ munge4 = function(tpm_exons){
   d.n = d.n %>% group_by(gene,tissue,sample,rep, source,parent,prog,pos.gene,end.gene) %>% summarize(value = mean(value)) %>% as.data.frame()
   return(d.n)
 }
+
 counts_to_tpm <- function(counts, featureLength, meanFragmentLength) {
   
   # Ensure valid arguments.
