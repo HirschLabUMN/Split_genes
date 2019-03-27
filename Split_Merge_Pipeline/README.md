@@ -96,7 +96,11 @@ qsub Nucmer_All_by_All/Mummer_Run_B73.sh
 # The command will run on all files within the directory the command is run
 bash Nucmer_All_by_All/mummer_post_process.sh
 ```
-* Once all databases and nucmer output files have run, we then run the all by all pipeline
+* Once all databases and nucmer output files have run, we then run the all by all pipeline (14 ish hours to run on one core)
+* This pipeline is set to use a 500kb flanking window (lines 357-360 in script)
+* This pipeline will also prioritize by e-value then size of blast match if there is a tie
+* You must also be able to call blasnt from the command line
+* -g is the gene delimiter to split the ZMxyz from the numerical order to see if genes are within "5" of each other
 ```python3
 # modify the propogator file with your respective files and paths
 # The "SPLIT" variable is the character used to split gene number with chromosome so we can see if genes are numerically next to each other
@@ -118,4 +122,161 @@ bash Nucmer_All_by_All/all_by_all_propogator.sh > Nucmer_All_by_All/aba_commands
 # If you wanted to run three commands on MSI you can run a command like
 module load parallel
 parallel --jobs 3 < Nucmer_All_by_All/aba_commands.txt
+```
+
+## Comparing reciprocal split merge files
+* I did not make a script for this, but I made a series of Python functions that you could either wrap in a script or run in iPython
+* Within Split_merge_compare.py you would run these functions interactily on the output files from the All_By_All_Blast.py files in both directions
+* using 4 cores takes about 15 seconds
+```python
+#Load up all of these functions
+import pandas as pd
+import multiprocessing
+from functools import partial
+import numpy as np
+
+
+
+def one_to_one_compare(comparison_1, comparison_2):
+    """Compare one to one gene key files from an
+       all by all blast comparsion"""
+    total = comparison_1.shape[0]
+    interm = 0
+    one2one = 0
+    for row in comparison_1.itertuples():
+        if row.gene_type == "one_to_one_mapping":
+            interm += 1
+            Q_gene = row.Query_gene
+            S_gene = row.Sytentic_genes.split(",")[0]
+            # get the index of the query gene in second file using subject gene var
+            idx = comparison_2[comparison_2.Query_gene.isin([S_gene])].index.tolist()
+            # check to see if the index is empty
+            if idx:
+                if comparison_2.at[idx[0], "gene_type"] == "one_to_one_mapping":
+                    comp_2_S_gene = comparison_2.at[idx[0], "Sytentic_genes"].split(",")[0]
+                    if comp_2_S_gene == Q_gene:
+                        one2one += 1
+    return(total, interm, one2one)
+
+
+# Split gene iteration function
+def recip_compare(s_file, c_file):
+    """Compare split and merge gene calls across reciprocal blast files"""
+    recip_list = []
+    cross_match = 0
+    for row in s_file.itertuples():
+        Q_gene = row.Query_gene
+        adj_gene_interm = row.adjacent_genes.split(";")
+        # list comp to strip metadata and keep gene name
+        adj_genes = [i.split(",")[0] for i in adj_gene_interm]
+        counter = 0
+        for adj_gene in adj_genes:
+            Q_search = c_file[c_file.Query_gene.isin([adj_gene])].index.tolist()
+            # check to to see that the is one to one match first
+            if Q_search and c_file.at[Q_search[0], "gene_type"] =="one_to_one_mapping":
+                # Q_search will always results in a list size of 1
+                S_search = c_file.at[Q_search[0], "Sytentic_genes"].split(",")[0]
+                if S_search == Q_gene:
+                    counter += 1
+        if counter == len(adj_genes):
+            cross_match += 1
+            recip_list.append(row)
+    recip_df = pd.DataFrame(recip_list)
+    return(recip_df)
+
+# Create a function to open up the file and set up parallelization
+def All_By_All_compare(i_file1, i_file2, cores):
+    """Parallel calls for one to one all by all blast, remember we are using
+    cores and not threads"""
+    num_processes = int(cores)
+    compare_1 = pd.read_csv(i_file1, sep="\t", index_col=False)
+    compare_2 = pd.read_csv(i_file2, sep="\t", index_col=False)
+    chunks = np.array_split(compare_1, num_processes)
+    # pool.map will only take one arg so set up partial fill
+    parallel = partial(one_to_one_compare, comparison_2=compare_2)
+    pool = multiprocessing.Pool(processes=num_processes)
+    result_list = pool.map(parallel, chunks)
+    # our fuction returns lists and we want each item to sum accord to pos
+    result = [sum(i) for i in zip(*result_list)]
+    return(result)
+
+
+# check confirmation of split vs merged genes in both direction
+def split_compare(i_file1, i_file2, cores):
+    """Parallel calls for split merge compare from by all blast in reciprocal
+    direcitons, remember we are using cores and not threads"""
+    num_processes = int(cores)
+    file1 = pd.read_csv(i_file1, sep="\t", index_col=False)
+    file2 = pd.read_csv(i_file2, sep="\t", index_col=False)
+    f1_split = file1[file1.gene_type.isin(["adjacent_genes_syntenic"])]
+    f2_split = file2[file2.gene_type.isin(["adjacent_genes_syntenic"])]
+
+    # set up for parallelization
+    chunks_1 = np.array_split(f1_split, num_processes)
+    # pool.map will only take one arg so set up partial fill
+    parallel_1 = partial(recip_compare, c_file=file2)
+    pool = multiprocessing.Pool(processes=num_processes)
+    # Will return list of pd dfs, need to concat
+    recip_1 = pd.concat(pool.map(parallel_1, chunks_1))
+
+    # set up for parallelization
+    chunks_2 = np.array_split(f2_split, num_processes)
+    parallel_2 = partial(recip_compare, c_file=file1)
+    recip_2 = pd.concat(pool.map(parallel_2, chunks_2))
+
+    # merge from both tested directions
+    merged_recip = pd.concat([recip_1, recip_2])
+    return(merged_recip)
+
+
+# exmpale run commands
+# This command will return the total number of genes that are one to one
+# to each other in both directions
+JMM_ABA_B73_Mo17 = All_By_All_compare("B73_Mo17_AllbyAll_res.txt",
+                                      "Mo17_B73_AllbyAll_res.txt",
+                                      4)
+
+# This command will return a dataframe with reciprocal split/merged in agreement
+JMM_SC_B73_Mo17 = split_compare("B73_Mo17_AllbyAll_res.txt",
+                                "Mo17_B73_AllbyAll_res.txt",
+                                4)
+
+# You would then write this to a file using a command such as this (leave index in for next script)
+JMM_SC_B73_Mo17.to_csv("500kb_B73_Mo17_recip_SM.txt", sep="\t")
+```
+* Then you can manually scan the files for any interesting candidates.
+
+## Arabidopsis CDS comparison
+* To see which genes are represented as split or merged in Arabidopsis run the "QueryDB_CDS.py" script
+* I propgated a file called arabidopsis_blast_cmd.txt containing all of the previous commands
+* FULL DISCLOSURE: The -o command does nothing, I hacked at the script to make it output to STD out before the maize meeting so the -o option is reqired but does not do anything
+* This can be modified in the getopts portion of the script, but I left it there in case we wanted a file output
+* Takes about 30 minutues to run for one file
+```python
+python ../QueryDB_CDS.py \
+-i 500kb_B73_Mo17_recip_SM.txt  \
+-o Arabidopsis_Blast/5500kb_B73_Mo17_recip_SM_Arabidopsis.txt \
+-m /home/hirschc1/broha006/software/synmap/b73-phb47/b73.repcds.fa \
+-s /panfs/roc/groups/13/stuparr/mich0391/software/synmap/mo17-b73/mo17.repcds.fa \
+-d ../../Data_Bases/ArabidopsisRepGenes \
+>> Arabidopsis_Blast/500kb_B73_Mo17_recip_SM_Arabidopsis.txt
+
+python ../QueryDB_CDS.py \
+-i 500kb_B73_Mo17_recip_SM.txt  \
+-o Arabidopsis_Blast/5500kb_B73_Mo17_recip_SM_Arabidopsis.txt \
+-m /home/hirschc1/broha006/software/synmap/b73-phb47/b73.repcds.fa \
+-s /panfs/roc/groups/13/stuparr/mich0391/software/synmap/mo17-b73/mo17.repcds.fa \
+-d ../../Data_Bases/ArabidopsisRepGenes \
+>> Arabidopsis_Blast/500kb_B73_Mo17_recip_SM_Arabidopsis.txt
+```
+* It is also important to mention that I am using the >> to write to file since this script only works in one direction and will complain halfway in the split merged file since gene directions are reversed
+* I wrote the commands so both directions would write to the same file then I would anti grep the file for "NOT CALLABLE" to get to the filtered list
+```bash
+grep -v "NOTCALLABLE" Arabidopsis_Blast/500kb_B73_Mo17_recip_SM_Arabidopsis.txt > Arabidopsis_Blast/500kb_B73_Mo17_recip_SM_Arabidopsis_Filtered.txt
+
+# Here is a for loop bash version for all files in a DIR
+for i in $( ls ); do
+    NAME=$(basename $i | cut -d. -f1)
+    grep -v CALLABLE ${i} > ${NAME}_filtereted.txt
+done
 ```

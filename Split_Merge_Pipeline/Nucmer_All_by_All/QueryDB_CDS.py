@@ -13,10 +13,9 @@ def usage():
             -o or --outputfile   : Name of your results or output file
             -m or --merged_fgg   : path to merged CDS file
             -s or --split_gff    : path to split CDS file
-            -d or --data_base    : path to blast data base location
+            -d or --data_base    : path to balst data base location
             -h or --help         : help command
         \n""")
-
 
 try:
     opts, args = getopt.getopt(sys.argv[1:],
@@ -54,7 +53,17 @@ for opt, arg in opts:
 
 # Set the hardcoded paths
 data = open(infile, "r")
-results_file = open(outfile, "w")
+# results_file = open(outfile, "w")
+# merge_gff = "B73_genes.gff3"
+# merge_fasta = "/panfs/roc/groups/6/maize/shared/databases/genomes/" \
+#               "Zea_mays/B73/Zea_mays.AGPv4.dna.toplevel.fa"
+# split_gff = "W22_genes.gff3"
+# split_fasta = "/home/maize/shared/databases/genomes/" \
+#               "Zea_mays/W22/W22__Ver12.genome.normalized.fasta"
+
+
+# merge_gene = "Zm00001d002216"
+# splits = ["Zm00004b006245", "Zm00004b006246", "Zm00004b006244"]
 
 # Write a header
 print("Query_merged_gene",
@@ -67,9 +76,9 @@ print("Query_merged_gene",
       "Adjacent_genes_intersect",
       "Adjacent_genes",
       "Intersect_genes",
-      sep="\t",
-      file=results_file)
-results_file.flush()
+      sep="\t")
+sys.stdout.flush()
+#results_file.flush()
 
 
 # Make calling a subprocess easier
@@ -132,15 +141,14 @@ def ortho_blast(gene, gff):
 
     return (blast_genes)
 
-
 for input_line in data:
     input_line = input_line.strip()
     input_fields = input_line.split("\t")
-    merge_gene = input_fields[0]
+    merge_gene = input_fields[1]
     # splits = input_fields[2].split(",")
-    splits = [i.split(",")[0] for i in input_fields[13].split(";")]
-    call = input_fields[3]
-    state = input_fields[4]
+    splits = [i.split(",")[0] for i in input_fields[14].split(";")]
+    call = input_fields[4]
+    state = input_fields[5]
 
     merge_list = ortho_blast(merge_gene,
                              merge_gff,
@@ -209,10 +217,10 @@ for input_line in data:
           ladjacent_genes,
           padjacent_genes,
           pgene_overlap,
-          sep="\t",
-          file=results_file)
-    results_file.flush()
+          sep="\t")
+    sys.stdout.flush()
+#    results_file.flush()
 
 
-results_file.close()
+#results_file.close()
 data.close()
