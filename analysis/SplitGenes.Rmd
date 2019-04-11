@@ -21,11 +21,13 @@ library(magrittr)
 library(DESeq2)
 library(DEXSeq)
 library(wrapr)
+library(scales)
 
 #mask these functions from other packages
 select <- dplyr::select
 filter <- dplyr::filter
 mutate <- dplyr::mutate
+summarize <- dplyr::summarize
 
 # Load Data
 b.splits = read.table("~/Documents/Research/Maize/Split_genes/input/B73_LT_HTseq_splitGene_key.500kb.t0.1.txt", head=T)
@@ -172,17 +174,17 @@ formatData = function(counts,splits,fsplits, minTPM=0, sampleID = c("B", "P", "W
     print("Re-munging...")
     p = munge(ww, c("exon","gene","parent","prog", "famnum", "source","pos.exon","end.exon","rowid","basepairs","pos.gene","end.gene"))
     #Average TPM across exons and label parents
-    pp = p %>% group_by(gene, tissue, sample, rep, source, parent, prog, pos.gene, end.gene) %>% summarize(value = mean(value)) %>% mutate(isParent = ifelse(as.character(gene) == as.character(parent), TRUE, FALSE)) %>% as.data.frame()
-    # pp = p %>% group_by(gene, tissue, sample, rep, source, parent, prog, pos.gene, end.gene) %>% filter(value!=0) %>% summarize(value = mean(value)) %>% mutate(isParent = ifelse(as.character(gene) == as.character(parent), TRUE, FALSE)) %>% as.data.frame()
-    ppp = p %>% group_by(gene, tissue, sample, rep, source, parent, prog, pos.gene, end.gene) %>% mutate(expressed=ifelse(value!=0,1,0)) %>% summarize(numExp = sum(expressed), numExons = n())
+    pp = p %>% group_by(gene, tissue, sample, rep, source, parent, prog, pos.gene, end.gene) %>% summarize(value = mean(value)) %>% as.data.frame()
+    # pp = p %>% group_by(gene, tissue, sample, rep, source, parent, prog, pos.gene, end.gene) %>% filter(value!=0) %>% mutate(isParent = ifelse(as.character(gene) == as.character(parent), TRUE, FALSE)) %>% summarize(value = mean(value)) %>% as.data.frame()
+    ppp = p %>% group_by(gene, tissue, sample, rep, source, parent, prog, pos.gene, end.gene) %>% mutate(isParent = ifelse(as.character(gene) == as.character(parent), TRUE, FALSE), expressed=ifelse(value!=0,1,0)) %>% summarize(numExp = sum(expressed), numExons = n(), isParent=unique(isParent))
     p = left_join(pp,ppp,by=c("gene", "tissue", "sample", "rep", "source", "parent", "prog", "pos.gene", "end.gene"))
   }
 return(p)
 }
 
-calcM2f = function(df, sampleID, minTPM = 0){
+calcM2f = function(df, sampleID, minTPM = 0, FUN=mean){
   # Only consider the split/child genes, filter out 0s, unwanted samples
-  DF = df %>%filter(isParent == FALSE & value > minTPM & sample == sampleID) %>% group_by(parent, prog, source, sample, rep, tissue) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent, prog, source) %>% summarize(M2f = mean(m2f,na.rm=T), numTiss=length(unique(as.character(tissue))), BiDiffMean = NaN)
+  DF = df %>%filter(isParent == FALSE & value > minTPM & sample == sampleID) %>% group_by(parent, prog, source, sample, rep, tissue) %>% summarize(m2f = getAvgLog(value)) %>% ungroup() %>% group_by(parent, prog, source) %>% summarize(M2f = FUN(m2f,na.rm=T), numTiss=length(unique(as.character(tissue))), BiDiffMean = NaN)
   badPars = DF %>% filter(M2f=="NaN")
   DF2 = df %>%filter(parent %in% badPars$parent & isParent == FALSE & sample == sampleID) %>% mutate(expressed = ifelse(value > 0, 1, 0)) %>% group_by(parent, prog, source, sample, rep, tissue) %>% summarize(diff = mean(abs(diff(expressed)))) %>% ungroup() %>% group_by(parent, prog, source) %>% summarize(M2f = NaN, numTiss=length(unique(as.character(tissue))), BiDiffMean = sum(diff))
   DF %<>% filter(M2f!=0) %>% as.data.frame()
@@ -191,6 +193,7 @@ calcM2f = function(df, sampleID, minTPM = 0){
 }
  
 plot.m2f = function(df, merged_quantile, split_quantile, xmin = 0, xloc = 0.2, yloc = 1.3){
+    df %<>% filter(M2f!="-Inf")
     counts = as.character(countExceeds2(df, merged_quantile,split_quantile))
     tot = nrow(df[df$source == "real" & !is.nan(df$M2f),])
     plt = ggplot(df[df$M2f > xmin,], aes(x=M2f, fill=source)) + geom_density(alpha=0.5) + geom_vline(xintercept = quantile(df[df$source=="fakeSplit",]$M2f, split_quantile, na.rm=T), color = "green", linetype = "longdash") + geom_vline(xintercept = quantile(df[df$source=="fakeMerged",]$M2f, merged_quantile, na.rm = T), linetype = "longdash", color = "red") + scale_x_log10() + theme_bw() + annotate("text", x = xloc, y = yloc, label = paste("Merge =", counts[2],"\nSplit =", counts[1], "\nTotal =", tot)) + xlab(expression(paste("Mean ", log[2], "(", g[x], "/", g[y], ")")))
@@ -223,7 +226,7 @@ labelExceeds = function(df, merged_quantile, split_quantile, Source = c("real"))
 ```
 
 
-##Begin analysis of m2f
+##Calculate m2f
 ```{r}
 #Combine HTseq count data, split gene candidates, and fakeData candidates
 pp = formatData(p.counts, p.splits, p.fsplits, sampleID = "P", fmt = "m2f")
@@ -236,38 +239,159 @@ P.r = calcM2f(pp, "P", minTPM = 0.01)
 B.r = calcM2f(bb, "B", minTPM = 0.01)
 W.r = calcM2f(ww, "W", minTPM = 0.01)
 
+W.r['geno']="W"
+B.r['geno']="B"
+P.r['geno']="P"
 
-# Make density plots with significance thresholds
-plot.m2f(P.r, 0.001, 0.999, xmin=0.1)
-plot.m2f(W.r, 0.001, 0.999, xmin=0.1)
-plot.m2f(B.r, 0.001, 0.999, xmin=0.1)
+ALL = do.call("rbind",list(W.r,P.r,B.r))
 
-#Label splitGene candidates based on whether they exceed the specified quartile
-PP.r = labelExceeds(P.r, merged_quantile = 0.1, split_quantile = 0.9)
-WW.r = labelExceeds(W.r, 0.1, 0.9)
-BB.r = labelExceeds(B.r, 0.1, 0.9)
+#classify candidate split-genes 
+upper_quantile = 0.9
+lower_quantile = 0.1
+
+ALL %<>% mutate(Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f, upper_quantile, na.rm=T), "Split", ifelse(M2f < quantile(ALL[ALL$source == "fakeMerged",]$M2f, lower_quantile, na.rm=T), "Merged", "NoCall")))
+
+ALL %<>% mutate(Par = ifelse(grepl("Zm00001", parent), "B", ifelse(grepl("Zm00008", parent), "P", "W")))
 ```
 
-Candidate summary
+#Investigate effects of using different functions to summarize instead of just Mean
 ```{r}
+W.r.max = calcM2f(ww, "W", minTPM = 0.01,FUN=max)
+W.r.med = calcM2f(ww, "W", minTPM = 0.01,FUN=median)
+W.r.var = calcM2f(ww, "W", minTPM = 0.01,FUN=var)
+plot.m2f(W.r, 0.1, 0.9, xmin=0.1)
+plot.m2f(W.r.max, 0.1, 0.9, xmin=0.1)
+plot.m2f(W.r.med, 0.1, 0.9, xmin=0.1)
+plot.m2f(W.r.var, 0.1, 0.9, xmin=0.1)
+
+WW.r = labelExceeds(W.r, 0.1, 0.9)
+WW.r.max = labelExceeds(W.r.max , 0.1, 0.9)
+WW.r.med = labelExceeds(W.r.med, 0.1, 0.9)
+WW.r.var = labelExceeds(W.r.var, 0.1, 0.9)
+
+WW = merge(WW.r,WW.r.max,by=c("parent","prog","source"),suffixes=c(".mean",".max"))
+WW = merge(WW,WW.r.med,by=c("parent","prog","source"))
+WW = merge(WW,WW.r.var,by=c("parent","prog","source"),suffixes=c(".med",".var"))
+
+WW %>% group_by(Output_call.mean, Output_call.max, Output_call.med, Output_call.var) %>% summarize(n=n()) %>% as.data.frame()
+```
+
+# Candidate summary
+```{r}
+
+####Check LABELS HERE.  NOT SURE THAT SPLITS, ONE TO ONE, AND MERGED ARE BEING APPROPRIATELY LABELLED.  
+# WHAT DO YOU WANT TO SHOW HERE?  PROPERTIES OF GENES THAT WERE INITIALLY MISANNOTATED? THIS IS CURRENTLY SHOWING THE PROPERTIES OF THE CORRECT CALLS AS I UNDERSTAND IT.
+
+#MUTATE A VARIABLE COMBINES STATE AND CALL. EACH GENOTYPE GETS 5 CATEGORIES: ANNOTATED AS SPLIT + CALLED AS SPLIT, ANNOTATED AS MERGE + CALLED AS MERGE, ANNOTATED AS SPLIT + CALLED AS SPLIT, ANNOTATED AS MERGE + CALLED AS MERGE
+#FOR INCORRECT, USE FOR UNCHANGED: CALLED_SPLIT IS SPLIT AND PARENT 
+## Need to filter unchanged genes to only contain one-to-one.  currently it could contain nonsyntenic genes
+
+ALL %<>% mutate(Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f, upper_quantile, na.rm=T), "Split", ifelse(M2f < quantile(ALL[ALL$source == "fakeMerged",]$M2f, lower_quantile, na.rm=T), "Merged", "NoCall")))
+
+cMerge = ALL %>% filter(source=="real" & Call == "Merged")
+cSplits = ALL %>% filter(source=="real" & Call == "Split")
+
 bb["ref"]="B73"
 ww['ref']="W22"
 pp['ref']="PH207"
 
-all = rbind(bb,ww)
-all = rbind(all,pp)
+all = do.call("rbind", list(bb,ww,pp))
 
-all["length"] = all$end.gene - all$pos.gene
-
-bb %>% filter(source=="real")
+all %<>% mutate(length = end.gene - pos.gene, propExp = numExp / numExons)
 
 all %<>% mutate(ISPAR = ifelse(gene %in% bb[bb$source=="real",]$parent, TRUE, ifelse(gene %in% pp[pp$source=="real",]$parent, TRUE, ifelse(gene %in% ww[ww$source=="real",]$parent,TRUE,FALSE))))
 
-all %>% filter(source %in% c("real","unchanged")) %>% filter(!(source=="real" & ISPAR==TRUE)) %>% select(source,value,prog,ISPAR,sample) %>% distinct() %>% ggplot(.,aes(x=abs(value),fill=paste(source,ISPAR),y=sample)) + geom_density_ridges(alpha=0.5,scale=0.99) + scale_x_log10(labels=comma) + scale_fill_manual(name="",labels=c("Splits","One-to-One", "Merged"),values=wes_palette("Royal1")) + xlab("Transcripts per Million") + ylab("Genotype") + theme_bw() + theme(axis.text.y=element_text(size=16), axis.title.y=element_text(size=18),axis.text.x=element_text(size=16),axis.title.x=element_text(size=18),legend.text = element_text(size=18))
+all %<>% mutate(gene.ref = case_when(substr(gene, 7, 7) == "1" ~ "B", substr(gene, 7, 7) == "8" ~ "P", substr(gene, 7, 7) == "4" ~ "W"))
 
-all %>% filter(source %in% c("real","unchanged") & called_split!="nocall" & isParent==FALSE) %>% select(gene.ref,source,length,numExp,numExons,propExp,called_split,value) %>% ggplot(.) + geom_density_ridges(data = ., aes(y=gene.ref,x=value,fill=called_split),alpha=0.5,scale=0.99) + scale_x_log10(labels=comma) + scale_fill_manual(name="",labels=c("Kept Split","Merged Splits"),values=wes_palette("Moonrise2")) + xlab("Transcripts per Million") + ylab("Genotype") + theme_bw()+ theme(axis.text.y=element_text(size=16), axis.title.y=element_text(size=18),axis.text.x=element_text(size=16),axis.title.x=element_text(size=18),legend.text = element_text(size=18))
+all %<>% mutate(called_split = ifelse(parent %in% cSplits$parent, "split", ifelse(parent %in% cMerge$parent, "merge", "nocall")))
+all$called_split = as.factor(all$called_split)
+
+all %<>% mutate(Called_split = paste(called_split,ISPAR))
+
+all$called_split=factor(all$called_split,levels(all$called_split)[c(3, 2, 1)])
+
+#Isolate one to one genes
+all.11 = all %>% filter(gene %in% oo$V1 | gene %in% oo$V2) %>% mutate(called_split = "One-to-one")
+
+#Isolate just the classified split and merged info
+#This missing some genes...what about the real merged genes that are part of fakeSplit or fakeMerge??  Do these even exist?
+#This filtered the merge calls that are not parents (the incorrect split genes).  These need to be retained...
+all2 = all %>% filter(source %in% c("real","unchanged") & called_split %in% c("split","merge"))
+all2 = rbind(all2, all.11)
+
+all2$called_split=factor(all2$called_split)
+all2$called_split=factor(all2$called_split,levels(all2$called_split)[c(1, 3, 2)])
+
+all2 %<>% mutate(State = paste(called_split,ISPAR, sep=""))
+
+all2 %<>% mutate(State = replace(State, grepl("One-to-one", State), "One-to-one"))
+
+all2$State=factor(all2$State)
+all2$State=factor(all2$State,levels(all2$State)[c(3, 4, 1, 2, 5)])
 
 
+#How many genes are we encompassed by our candidates??
+all %>% filter(source=="real") %>% group_by(ref) %>% distinct(gene) %>% summarize(n=n())
+
+# Gene length plot
+all2 %>% filter(called_split != "nocall") %>% filter((source=="real" & ISPAR==F & called_split=="split") | (called_split=="One-to-one") | (called_split=="merge" & ISPAR==T)) %>% select(source,value,prog,ISPAR,sample,length, called_split) %>% distinct() %>% ggplot(.,aes(x=sample,fill=called_split,y=abs(length)/1000)) + geom_boxplot(outlier.shape=NA) + scale_y_log10(label=comma) + scale_fill_manual(name="",labels=c("Splits","One-to-One", "Merged"),values=wes_palette("Royal1")) + xlab("Genotype") + ylab("Gene length (kb)") + theme_bw() + theme(axis.text.y=element_text(size=16), axis.title.y=element_text(size=18),axis.text.x=element_text(size=16),axis.title.x=element_text(size=18),legend.text = element_text(size=18))
+
+#Exon number
+all2 %>% filter(called_split != "nocall") %>% filter((source=="real" & ISPAR==F & called_split=="split") | (called_split=="One-to-one") | (called_split=="merge" & ISPAR==T)) %>% select(source,numExons,prog,ISPAR,sample, called_split) %>% distinct() %>% ggplot(.,aes(x=sample,fill=called_split,y=abs(numExons))) + geom_boxplot() + scale_y_log10(labels=comma) + scale_fill_manual(name="",labels=c("Splits","One-to-one", "Merged"),values=wes_palette("Royal1")) + xlab("Genotype") + ylab("Exon Number") + theme_bw()+ theme(axis.text.y=element_text(size=16), axis.title.y = element_text(size=18), axis.text.x=element_text(size=16), axis.title.x=element_text(size=18), legend.text = element_text(size=18))
+
+#Proportion of exons that are expressed
+all2 %>% filter(called_split != "nocall") %>% filter((source=="real" & ISPAR==F & called_split=="split") | (called_split=="One-to-one") | (called_split=="merge" & ISPAR==T)) %>% select(source,numExons,prog,ISPAR,sample, called_split, propExp) %>% distinct() %>% ggplot(.,aes(x=sample,fill=called_split,y=abs(propExp))) + geom_boxplot() + scale_fill_manual(name="",labels=c("Splits","One-to-one", "Merged"),values=wes_palette("Royal1")) + xlab("Genotype") + ylab("Proportion of expressed exons") + theme_bw()+ theme(axis.text.y=element_text(size=16), axis.title.y = element_text(size=18), axis.text.x=element_text(size=16), axis.title.x=element_text(size=18), legend.text = element_text(size=18))
+
+
+# Expression distributions
+all2 %>% filter(called_split != "nocall" & value != 0) %>% filter((source=="real" & ISPAR==F & called_split=="split") | (called_split=="One-to-one") | (called_split=="merge" & ISPAR==T)) %>% select(gene.ref,source,length,numExp,numExons,propExp,called_split,value) %.>% ggplot(., aes(y=gene.ref,x=value,fill=called_split)) + geom_density_ridges(alpha=0.5,scale=0.99) + scale_x_log10(labels=comma) + scale_fill_manual(name="",labels=c("Kept Split","One-to-one","Merged Splits"),values=wes_palette("Royal1")) + xlab("Transcripts per Million") + ylab("Genotype") + theme_bw()+ theme(axis.text.y=element_text(size=16), axis.title.y = element_text(size=18), axis.text.x=element_text(size=16), axis.title.x=element_text(size=18), legend.text = element_text(size=18))
+
+#Number of tissues in which gene is expressed
+all2 %>% filter(called_split != "nocall" & value!=0) %>% filter((source=="real" & ISPAR==F & called_split=="split") | (called_split=="One-to-one") | (called_split=="merge" & ISPAR==T)) %>% group_by(gene.ref,gene, parent, prog, called_split, sample, source, ISPAR) %>% summarize(numTiss = n() / 2) %>% ggplot(., aes(x = sample, fill = called_split, y=numTiss)) + geom_boxplot() + scale_y_log10(labels=comma) + scale_fill_manual(name="",labels=c("Splits","One-to-one", "Merged"),values=wes_palette("Royal1")) + xlab("Genotype") + ylab("Number of Tissues") + theme_bw() + theme(axis.text.y=element_text(size=16), axis.title.y = element_text(size=18), axis.text.x=element_text(size=16), axis.title.x=element_text(size=18), legend.text = element_text(size=18))
+
+
+#Distance between genes
+p.dist = p.fsplits %>% filter(source=="unchanged") %>% distinct(chrom,pos.gene,end.gene,gene,source,parent) %>% mutate(sort="group2")
+p.dist2 = p.splits %>% distinct(chrom,pos.gene,end.gene,gene,parent) %>% mutate(source="real",sort="group1") %>% rbind(.,p.dist)
+P.dist = p.fsplits %>% filter(gene %in% b.splits$parent | gene %in% w.splits$parent) %>% distinct(chrom,pos.gene,end.gene,gene,parent) %>% mutate(source="merged",sort="group2") %>% rbind(.,p.dist2)
+
+b.dist = b.fsplits %>% filter(source=="unchanged") %>% distinct(chrom,pos.gene,end.gene,gene,source,parent) %>% mutate(sort="group2")
+b.dist2 = b.splits %>% distinct(chrom,pos.gene,end.gene,gene,parent) %>% mutate(source="real",sort="group1") %>% rbind(.,b.dist)
+B.dist = b.fsplits %>% filter(gene %in% p.splits$parent | gene %in% w.splits$parent) %>% distinct(chrom,pos.gene,end.gene,gene,parent) %>% mutate(source="merged",sort="group2") %>% rbind(.,b.dist2)
+
+w.dist = w.fsplits %>% filter(source=="unchanged") %>% distinct(chrom,pos.gene,end.gene,gene,source,parent) %>% mutate(sort="group2")
+w.dist2 = w.splits %>% distinct(chrom,pos.gene,end.gene,gene,parent) %>% mutate(source="real",sort="group1") %>% rbind(.,w.dist)
+W.dist = w.fsplits %>% filter(gene %in% p.splits$parent | gene %in% b.splits$parent) %>% distinct(chrom,pos.gene,end.gene,gene,parent) %>% mutate(source="merged",sort="group2") %>% rbind(.,w.dist2)
+
+W.dist %<>% arrange(sort,chrom,pos.gene) %>% mutate(diff = pmin(abs(pos.gene - lag(end.gene)), abs(end.gene - lead(pos.gene))))
+P.dist %<>% arrange(sort,chrom,pos.gene) %>% mutate(diff = pmin(abs(pos.gene - lag(end.gene)), abs(end.gene - lead(pos.gene))))
+B.dist %<>% arrange(sort,chrom,pos.gene) %>% mutate(diff = pmin(abs(pos.gene - lag(end.gene)), abs(end.gene - lead(pos.gene))))
+
+dist = do.call("rbind", list(W.dist, P.dist, B.dist))
+
+dist %<>% mutate(gene.ref = case_when(substr(gene, 7, 7) == "1" ~ "B", substr(gene, 7, 7) == "8" ~ "P", substr(gene, 7, 7) == "4" ~ "W"))
+dist$source=as.factor(dist$source)
+dist$source=factor(dist$source,levels(dist$source)[c(2,3,1)])
+
+dist %<>% mutate(called_split = ifelse(gene %in% cSplits$gene, "split", ifelse(parent %in% cMerge$parent, "merge", "nocall")))
+dist$called_split = as.factor(dist$called_split)
+
+dist %<>% mutate(ISPAR = ifelse(gene %in% bb[bb$source=="real",]$parent, TRUE, ifelse(gene %in% pp[pp$source=="real",]$parent, TRUE, ifelse(gene %in% ww[ww$source=="real",]$parent,TRUE,FALSE))))
+
+#Isolate one-to-ones
+dist.11 = dist %>% filter(gene %in% oo$V1 | gene %in% oo$V2) %>% mutate(called_split = "One-to-one")
+
+#Isolate candidates
+dist2 = dist %>% filter((source=="real" & called_split == "split") | (source %in% c("real","unchanged", "fakeSplit") & called_split == "merge" & ISPAR==T))
+
+dist2 = rbind(dist2, dist.11)
+
+dist2$called_split=factor(dist2$called_split)
+dist2$called_split=factor(dist2$called_split,levels(dist2$called_split)[c(3,2,1)])
+
+dist2 %>% filter(called_split != "nocall") %>% filter((source=="real" & ISPAR==F & called_split=="split") | (called_split=="One-to-one") | (called_split=="merge" & ISPAR==T)) %>% ggplot(., aes(y = diff/1000, x = gene.ref, fill = called_split)) + geom_boxplot(outlier.shape = NA) + scale_fill_manual(name="",values=wes_palette("Royal1"),labels=c("Split genes","One-to-One","Merged")) + scale_y_log10(label=comma) + xlab("Genotype") + ylab("Distance to nearest gene (kb)") + theme_bw()+ theme(axis.text.y=element_text(size=16), axis.title.y=element_text(size=18),axis.text.x=element_text(size=16),axis.title.x=element_text(size=18),legend.text = element_text(size=18))
+
+# Number of genes with no expression
 #This version does not throw out 0's
 formatData = function(counts,splits,fsplits, minTPM=0, sampleID = c("B", "P", "W"), minGenes = 1, fmt="de"){
   splits['source']="real"
@@ -323,9 +447,41 @@ ww2 %>% group_by(source,prog) %>% summarize(M2f = mean(value)) %>% ungroup() %>%
 bb2 %>% group_by(source,prog) %>% summarize(M2f = mean(value)) %>% ungroup() %>% group_by(source) %>% mutate(noExp = ifelse(M2f==0,1,0)) %>% summarize(noExp = sum(noExp), n=n(), prop = sum(noExp)/n())
 pp2 %>% group_by(source,prog) %>% summarize(M2f = mean(value)) %>% ungroup() %>% group_by(source) %>% mutate(noExp = ifelse(M2f==0,1,0)) %>% summarize(noExp = sum(noExp), n=n(), prop = sum(noExp)/n())
 
-
+#M2f does not correlate strongly with gene length which should be decent evidence that 3' sequencing bias is not driving results
+ALL['gene']=ALL$parent
+tt = merge(ALL,all[c("gene","length","numExons")], by="gene")
+ggplot(tt,aes(x=length,y=M2f)) + geom_point()
 ```
 
+
+
+
+#M2f distributions
+```{r}
+ALL %>% filter(source=="real" & !is.na(Call)) %>% group_by(geno, Call) %>% summarize(n=n())
+ALL %>% filter(source=="real" & !is.na(Call)) %>% group_by(geno) %>% summarize(n=n())
+
+ALL %>% filter(source=="real") %>% ggplot(.,aes(fill=geno,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="Genotype",values=wes_palette("GrandBudapest1"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
+ALL %>% filter(source %in% c("real")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1")) + ylim(0,1.4) 
+ALL %>% filter(source %in% c("real","fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1")) + ylim(0,1.4)
+ALL %>% filter(source %in% c("real","fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4)
+ALL %>% filter(source %in% c("real","fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4)
+ALL %>% filter(source %in% c("real","fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1")) + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4)
+ALL %>% filter(source %in% c("real","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates", "Sim. Merged"),values=wes_palette("Darjeeling1")) + ylim(0,1.4)
+ALL %>% filter(source %in% c("real","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates", "Sim. Merged"),values=wes_palette("Darjeeling1")) + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4)
+ALL %>% filter(source %in% c("fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3")) + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
+ALL %>% filter(source %in% c("fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
+ALL %>% filter(source %in% c("fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
+ALL %>% filter(source %in% c("fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3")) + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
+ALL %<>% mutate(Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T), "Split", ifelse(M2f < quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T), "Merged", "NoCall")))
+
+ALL %>% filter(source %in% c("fakeMerged")) %>% ggplot(.,aes(x = M2f, fill = "#F4B5BD")) + geom_density(alpha = 0.5) + scale_x_log10(limits = c(0.1,10)) + theme_bw() + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16), legend.position="NA",legend.text = element_blank())
+
+ALL$Call=as.factor(ALL$Call)
+ALL$Call=factor(ALL$Call,levels(ALL$Call)[c(2,1,3)])
+ALL %<>% mutate(Par = ifelse(grepl("Zm00001", parent),"B",ifelse(grepl("Zm00008",parent),"P","W")))
+ALL %>% filter(source=="real" & !is.na(Call)) %>% group_by(Par,geno,Call) %>% summarize(n=n()) %>% ggplot(.,aes(x=Call,fill=Call,y=n))+geom_bar(stat="identity") + facet_grid(rows=vars(geno),cols = vars(Par)) + xlab("") + theme_bw()+ theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) + theme(axis.text.x=element_blank(), axis.title.y = element_text(size=18), axis.text.y=element_text(size=16), legend.title=element_text(size=18), legend.text = element_text(size=16), axis.ticks.x=element_blank(), strip.text = element_text(size=16)) + scale_fill_manual(values = c("#F8766D", "#00BA38", "#619CFF"))
+```
 
 
 #Rate of DE of splitGenes
@@ -565,8 +721,6 @@ dex.b.p = runDEXseq(b, "B", "P")
 dex.w.p = runDEXseq(w, "W", "P")
 
 dex.p.w = runDEXseq(p, "P", "W")
-p
-
 
 rdex.p.b = DEXsum(dex.p.b)
 rdex.w.b = DEXsum(dex.w.b)
@@ -648,7 +802,24 @@ res.wp.jm %>% filter(source.x=="real" & called_split != "nocall") %>% group_by(p
 
 ##Comparing with JM's golden truth set based on blasting to A. thaliana
 ```{r}
+#OLD
 AT = read.table("~/Documents/Research/Split_genes/Blast_Comparisons/all_filt.txt",head=T)
+
+a.bw = read.table("~/Documents/Research/Maize/Split_genes/data/500kb_B73_W22_recip_SMV2_Arabidopsis_filteretedV2b.txt",head = T, fill=T)
+a.bp = read.table("~/Documents/Research/Maize/Split_genes/data/500kb_B73_PH207_recip_SMV2_Arabidopsis_filteretedV2b.txt",head = T, fill=T)
+a.pw = read.table("~/Documents/Research/Maize/Split_genes/data/500kb_PH207_W22_recip_SMV2_Arabidopsis_filteretedV2c.txt",head = T, fill=T)
+
+AT = do.call("rbind", list(a.bw, a.bp, a.pw))
+AT['prog']=AT$Query_split_gene
+AT['parent']=AT$Query_merged_gene
+ALL %<>% mutate(Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T), "SPLIT", ifelse(M2f < quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T), "MERGED", "NoCall")))
+
+all.at = merge(ALL, AT, by='parent')
+all.at %<>% filter(source=="real")
+all.at %<>% filter(as.character(prog.x) == as.character(prog.y))
+all.at$TandemDupPer = factor(all.at$TandemDupPer)
+all.at %>% filter((Call.x=="SPLIT" & Output_call=="MERGED") | (Call.x=="MERGED" & Output_call=="SPLIT")) %>% select(parent, prog.x, Intersect_genes,Adjacent_genes_intersect, Call.x, Output_call) %>% distinct(parent) %>% nrow()
+
 
 P.AT = AT %>%filter(Output_call %in% c("SPLIT", "MERGED") & parent %in% PP.r$parent) %>%select(parent, Call, Output_call)
 W.AT = AT %>%filter(Output_call %in% c("SPLIT", "MERGED") & parent %in% WW.r$parent) %>%select(parent, Call, Output_call)
@@ -707,13 +878,228 @@ cor(PB$M2f.x,PB$M2f.y)
 
 
 
+#IsoSeq analysis
+```{r}
+iso2 = read.table("~/Documents/Research/Maize/B73_isoseq/IsoSeq.sa.mq20.counts")
+
+iso = read.table("~/Documents/Research/Maize/B73_isoseq/IsoSeq.sa.counts")
+
+iso2['parent'] = iso2$V4
+PP.r %<>% left_join(.,iso2,by="parent")
+
+#Require reciprocal overlap of 0.75 for both isoseq reads and genes.  prevents overly long reads that span a gene but don't actually align to it at all.  
+iso3 = read.table("~/Documents/Research/Maize/B73_isoseq/IsoSeq.sa.mq20.Ff75.counts")
+iso3['parent'] = iso3$V4
+ALL %<>% left_join(.,iso3,by="parent")
+```
+
+
+
+Look for effect of minimum exon number flag in simulating splitMerges.  Also consider effect of multiple isoforms
+```{r}
+mi = read.table("~/Documents/Research/Maize/references/multiIsoform_B73.txt")
+P.r20 = calcM2f(pp20, "P", minTPM = 0.01)
+B.r20 = calcM2f(bb20, "B", minTPM = 0.01)
+W.r.jm20 = calcM2f(ww.jm20, "W", minTPM = 0.01)
+W.r.ab = calcM2f(ww.ab, "W", minTPM = 0.01)
+all['min.exons'] = 4
+W.r.jm2['ref'] = "W"
+B.r2['ref'] = "B"
+P.r2['ref'] = "P"
+W.r.jm2['min.exons'] = 2
+B.r2['min.exons'] = 2
+P.r2['min.exons'] = 2
+W.r.jm20['ref'] = "W"
+B.r20['ref'] = "B"
+P.r20['ref'] = "P"
+W.r.jm20['min.exons'] = 20
+B.r20['min.exons'] = 20
+P.r20['min.exons'] = 20
+W.r.jm8['ref'] = "W"
+B.r8['ref'] = "B"
+P.r8['ref'] = "P"
+W.r.jm8['min.exons'] = 8
+B.r8['min.exons'] = 8
+P.r['min.exons'] = 8
+All = do.call("rbind",list(all,W.r.jm2,B.r2,P.r2,W.r.jm20,B.r20,P.r20,W.r.jm8,B.r8,P.r8))
+All %>% filter(source=="fakeSplit") %>% ggplot(.,aes(x=M2f,fill=multiIso))+geom_density(alpha=0.5)+facet_grid(rows = vars(as.factor(min.exons)),cols = vars(ref))+scale_x_log10(limits=c(0.1,12))
+All %>% mutate(multiIso = ifelse(parent %in% mi$V1, 1,0)) %>% group_by(ref,source,min.exons) %>% summarise(num_multIso = sum(multiIso), n = n(), prop = sum(multiIso) / n())
+```
+
+
+#Are genes that are getting split disproportionately cases where one of the split genes is a single exon?
+```{r}
+all = do.call("rbind", list(pp,ww,bb))
+numEx = all %>% distinct(gene,numExons)
+splits = ALL %>% filter(Call=="Split") %>% separate(prog,c("gene1","gene2"))
+numEx['gene1']=numEx$gene
+numEx['gene2']=numEx$gene
+
+Splits=merge(Splits,numEx[,c('gene1','numExons')],by=c('gene1'))
+Splits=merge(Splits,numEx[,c('gene2','numExons')],by=c('gene2'), suffixes=c(".g1",".g2"))
+
+splits.m=melt(splits,value.var=c("numExons.g1","numExons.g2"),id.var=c("gene2","gene1","parent","source","M2f","numTiss","BiDiffMean","geno","Call"))
+
+Splits.m %>% filter(source=="real" & Call != "NA") %>% ggplot(.,aes(x=value)) + geom_histogram() + xlab("Number of Exons in Split genes") + facet_grid(~Call, scales = "free_y")
+```
+
+Investigating quality metrics of B gene models
+
+Position	Definition
+1	Length of the 5′ UTR
+2	Fraction of splice sites confirmed by an EST/mRNA-seq alignment
+3	Fraction of exons that match an EST/mRNA-seq alignment
+4	Fraction of exons that overlap EST/mRNA-seq or protein alignments
+5	Fraction of splice sites confirmed by ab initio gene prediction
+6	Fraction of exons that overlap an ab initio gene prediction
+7	Number of exons in the mRNA
+8	Length of the 3′ UTR
+9	Length of the protein sequence produced by the mRNA
+
+```{r}
+an = read.table("~/Documents/Research/Maize/Split_genes/misc/B73v4.annotation_scores2.txt",head=T, fill=T)
+an %<>% mutate(Call = ifelse(gene_id %in% sss$parent, "Split","NotSplit"))
+an %<>% separate(QI,into=c("Q1","Q2","Q3","Q4","Q5","Q6","Q7","Q8","Q9"),sep = "[|]")
+an %<>% separate(zscore.length.ave.sd.sp_list.ort_id.syn_id,into=c("zscore"),sep = "[:]")
+
+#ZSCORE IS BASED ON CANONICAL TRANSCRIPT...KEEP IN MIND FOR ZSCORES INTERPRETATION
+sss = ALL %>% filter(Call == "Split") %>% separate(prog,sep = ",",into=c("gene1","gene2","gene3","gene4"))
+ddd = ALL %>% filter(Call == "Merged") %>% separate(prog,sep = ",",into=c("gene1","gene2","gene3","gene4"))
+
+an %<>% mutate(bState = ifelse(gene_id %in% ddd$gene2 | gene_id %in% ddd$gene3 | gene_id %in% ddd$gene4 | gene_id %in% sss$gene1 | gene_id %in% sss$gene2 | gene_id %in% sss$gene3 | gene_id %in% sss$gene4, "Split", ifelse(gene_id %in% ddd$parent | gene_id %in% sss$parent, "Merged", "NoCall")), Call = ifelse(gene_id %in% sss$parent | gene_id %in% sss$gene1 | gene_id %in% sss$gene2 | gene_id %in% sss$gene3 | gene_id %in% sss$gene4, "Split", ifelse(gene_id %in% ddd$parent | gene_id %in% ddd$gene1 | gene_id %in% ddd$gene2 | gene_id %in% ddd$gene3 | gene_id %in% ddd$gene4, "Merged", "NoCall")))
+
+
+an %>% filter(zscore!="ND") %>% ggplot(.,aes(fill=Call,y=as.numeric(zscore))) + geom_boxplot() + ylab("Z-score of diff. in length b/n orthologous proteins") + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+#MAYBE FILTER FOR MAX AED ACROSS ALL TRANSCRIPTS
+an %>% ggplot(.,aes(fill=Call,y=AED, x = bWrong)) + geom_boxplot() + ylab("Annotation Edit Distance (AED)") + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% filter(bState != "NoCall") %>% group_by(bState, Call, gene_id) %>% summarize(AED = max(AED)) %>% ggplot(.,aes(x = bState, fill=Call,y=as.numeric(AED))) + geom_boxplot() + scale_x_discrete(labels=c("B = Merged", "B = Split")) + ylab("Annotation Edit Distance (AED)") +scale_fill_manual(name="",labels=c("Kept Split","Merged Splits"), values=wes_palette("Moonrise2")) + xlab("") + theme_bw() 
+
+#Maker Quality 
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q9))) + geom_boxplot() + ylab("Protein sequence length according to mRNA") + theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q1))) + geom_boxplot() + scale_y_log10() + ylab("Length of the 5′ UTR") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q2))) + geom_boxplot() + scale_y_log10() + ylab("Prop. splice sites confirmed by EST/mRNA-seq alignment") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q3))) + geom_boxplot() + scale_y_log10() + ylab("Prop. exons matching EST/mRNA-seq alignment") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q4))) + geom_boxplot() + scale_y_log10() + ylab("Prop. exons overlapping EST/mRNA-seq/protein alignments") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q5))) + geom_boxplot() + scale_y_log10() + ylab("Prop. splice sites confirmed by ab initio prediction") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q6))) + geom_boxplot() + scale_y_log10() + ylab("Prop. exons overlapping ab initio prediction") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q7))) + geom_boxplot() + scale_y_log10() + ylab("Number of exons in the mRNA") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+an %>% ggplot(.,aes(fill=Call,y=as.numeric(Q8))) + geom_boxplot() + scale_y_log10() + ylab("Length of the 3′ UTR") + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+
+```
+
+Correlation in M2f and consistency in calls in overlapping candidate sets
+E.g. 1W gene = 2B genes and same 1W gene = 2P genes
+```{r}
+
+ALL %<>% mutate(Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T), "Split", ifelse(M2f < quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T), "Merged", "NoCall")))
+
+ALL.r=ALL%>% filter(source=="real")
+
+dub.pars = ALL.r %>% group_by(parent) %>% summarize(n=n()) %>% filter(n==2)
+Dub.pars = ALL.r %>% filter(parent %in% dub.pars$parent) %>% mutate(dubtype = "merged")
+Dub.pars %<>% mutate(Geno = ifelse(grepl("Zm00001",prog),"B",ifelse(grepl("Zm00008",prog),"P","W")), key = parent)
+dub.prog = ALL.r %>% group_by(prog) %>% summarize(n=n()) %>% filter(n==2)
+Dub.prog = ALL.r %>% filter(prog %in% dub.prog$prog) %>% mutate(dubtype = "splits")
+Dub.prog %<>% mutate(Geno = ifelse(grepl("Zm00001",parent),"B",ifelse(grepl("Zm00008",parent),"P","W")), key = prog)
+
+dubs = rbind(Dub.pars,Dub.prog)
+dubs %<>% mutate(Par = ifelse(grepl("Zm00001",parent),"B",ifelse(grepl("Zm00008",parent),"P","W")), Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T), "Split", ifelse(M2f < quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T), "Merged", "NoCall")))
+
+dubs.m = melt(dubs, id.vars=c("parent","prog","source","numTiss","BiDiffMean","dubtype","Geno","key","Par"))
+
+Dubs = dubs.m %>% dcast(.,key + dubtype ~ Geno + variable,value.var=c("value"))
+Dubs %>% filter(dubtype=="merged") %>% ggplot(.,aes(x=W_M2f, y = P_M2f)) + geom_point() + geom_smooth(method="lm")
+
+#change to numeric
+Dubs$P_M2f = as.numeric(Dubs$P_M2f)
+Dubs$W_M2f = as.numeric(Dubs$W_M2f)
+Dubs$B_M2f = as.numeric(Dubs$B_M2f)
+
+#plot
+Dubs %>% filter(dubtype=="merged") %.>% ggplot(.) + geom_point(data=.,aes(y = P_M2f, x = B_M2f, color="#E1BD6D"), alpha=0.5)+ geom_smooth(data=.,aes(y = P_M2f, x = B_M2f, color = "#E1BD6D"), method = "lm", se = F) + geom_point(data=.,aes(y = B_M2f, x = W_M2f, color = "#0B775E"), alpha=0.5)+ geom_smooth(data=.,aes(y = B_M2f, x = W_M2f, color = "#0B775E"), method = "lm", se = F) + geom_point(data=.,aes(y = P_M2f, x = W_M2f, color = "#35274A"), alpha=0.5) + geom_smooth(data=.,aes(y = P_M2f, x = W_M2f, color = "#35274A"), method = "lm", se = F) + geom_hline(yintercept = 2.809204, color = "#619CFF", linetype = "dashed")  + geom_vline(xintercept = 2.809204, color = "#619CFF", linetype = "dashed") + geom_hline(yintercept = 1.156629, color = "#F8766D", linetype = "dashed")  + geom_vline(xintercept = 1.156629, color = "#F8766D", linetype = "dashed") + scale_color_manual(name = "Comparison", values = c("#E1BD6D", "#0B775E", "#35274A"), labels=c("B/W", "P/W", "P/B")) + theme_bw() + xlab(expression(paste("M2f"[1]))) + ylab(expression(paste("M2f"[2]))) + ylim(0,10) + xlim(0,10)
+
+Dubs %>% filter(dubtype=="merged") %.>% ggplot(.) + geom_hline(yintercept = 2.809204, color = "#619CFF", linetype = "dashed")  + geom_vline(xintercept = 2.809204, color = "#619CFF", linetype = "dashed") + geom_hline(yintercept = 1.156629, color = "#F8766D", linetype = "dashed")  + geom_vline(xintercept = 1.156629, color = "#F8766D", linetype = "dashed") + theme_bw() + xlab(expression(paste("M2f"[1]))) + ylab(expression(paste("M2f"[2]))) + ylim(0,10) + xlim(0,10)
+
+```
+
+Correlation in expression.
+Investigating whether expression estimates in one-to-one genes are more highly correlated as compared to the split-gene candidates, particularly those that were classified as split or merged.
+```{r}
+
+# One-to-one genes
+oo = read.table("~/Documents/Research/Maize/Split_genes/data/One_to_ones.txt")
+oo['gene'] = oo$V1
+oo %<>% group_by(V1,V2) %>% mutate(gene1 = min(as.character(V1),as.character(V2)), gene2 = max(as.character(V1),as.character(V2))) # Sort the one-to-one gene ids so that we can find reciprocals as pairs of matching gene ids
+
+#Filter for only reciprical one-to-one
+OO = oo %>% group_by(gene1,gene2) %>% summarize(n=n()) %>% filter(n==2)
+
+OO2 = oo %>% filter(V1 %in% OO$gene1 | V1 %in% OO$gene2) %>% select(V1, V2, gene)
+
+#Calculate normalized expression and format data
+pp2 = formatData(p.counts, p.splits, p.fsplits, fmt = "m2f")
+ww2 = formatData(w.counts, w.splits, w.fsplits, fmt = "m2f")
+bb2 = formatData(b.counts, b.splits, b.fsplits, fmt = "m2f")
+aa = do.call("rbind", list(pp2, ww2, bb2))
+
+#Average across replicates.  These will be x-values for scatterplot
+AA = aa %>% group_by(gene, tissue, sample) %>% summarize(value = mean(value))
+AA['gene1'] = AA$gene
+AA1 = merge(AA, OO2, by="gene")
+AA1['gene2'] = AA1$V2
+
+#Trying to match up x-values with y-values here, which would be expression of the partner in the one-to-one relationship 
+AA2 = AA1
+AA2['gene3'] = AA2$gene1 # Store gene1 value
+AA2['gene1'] = AA2$gene2 #Flip gene1 and gene2
+AA2['gene2'] = AA2$gene3
+
+AA1 %<>% select(tissue,sample,value,gene2, gene1)
+AA2 %<>% select(tissue,sample,value,gene2, gene1) # Get rid of extra variables
+
+AA3 = merge(AA1, AA2, by=c("gene1","gene2","tissue", "sample"))
+
+#Why are there so many one-to-one genes with no expression in one.
+AA3 %>% sample_n(100000) %>% ggplot(.,aes(y=value.y, x = value.x)) + geom_point() + scale_x_log10() + scale_y_log10()
+
+#Correlation in expression for split-gene candidates
+aa.prog = aa %>% filter(source == "real" & isParent==FALSE) %>% group_by(gene, tissue, sample) %>% summarize(value = mean(value))
+
+jj = aa %>% group_by(gene, tissue, sample) %>% summarize(value = mean(value))
+jj['parent'] = jj$gene
+
+kk = merge(aa.prog,jj, by=c("gene","tissue","sample"))
+
+# Currently y is merged genes and x axis is for split genes.  Results in unbalanced scatterplot.  Here im just reflecting the points so that they are represented twice in dataset
+ll = kk
+ll['a'] = kk$value.x
+ll['b'] = kk$value.y
+ll$value.y = ll$a
+ll$value.x = ll$b
+ll %<>% select(-a, -b)
+
+KK = rbind(ll, kk)
+
+#downsample one-to-ones so that data is of equivalent size to split-gene candidates.  
+AA4 = AA3 %>% sample_n(nrow(kk))
+
+#Plot correlation
+ggplot() + geom_point(data = KK, aes(y=value.y, x = value.x, color = "blue"), alpha=0.2) + geom_point(data=AA4, aes(x=value.x, y = value.y, color = "green"), alpha=0.2) + scale_color_manual(name = "", values = c("blue","green"), labels = c("Split-gene\nCandidates", "1-to-1")) + scale_x_log10(name = "Gene 1 Normalized Expression (TPM)", label = comma) + scale_y_log10(name = "Gene 2 Normalized Expression (TPM)", label = comma) + theme_bw()
+
+kk %>% filter(value.y!=0 & value.x!=0) %.>% cor(.$value.x,.$value.y)
+AA4 %>% filter(value.y!=0 & value.x!=0) %.>% cor(.$value.x,.$value.y)
+
+
+
+```
 
 # OLD
 ```{r}
 # Coordinate conversion results
 ccr = read.table("~/Documents/Research/MaizeSV/data/convert_coords_results.txt")
 setnames(ccr, old = c("V1","V2","V3","V4"), new = c("from","to","match","len"))
-
 # Combine HTSeq count data with splitGene bed info
 b.splits = read.table("~/Documents/Research/Split_genes/input/B73_LT_HTseq_splitGene_key.txt")
 b.fsplits = read.table("~/Documents/Research/Split_genes/input/B73_splitGenes_fake_m4.txt")
@@ -724,12 +1110,9 @@ w.counts=read.table("~/Documents/Research/Split_genes/input/Samples_LT_W22_Ref_H
 p.splits = read.table("~/Documents/Research/Split_genes/input/PH207_LT_HTseq_splitGene_key.txt")
 p.fsplits = read.table("~/Documents/Research/Split_genes/input/PH207_splitGenes_fake_m4.txt")
 p.counts=read.table("~/Documents/Research/Split_genes/input/Samples_LT_PH207_Ref_HTseq.txt", head=T)
-
 p.Counts=read.table("~/Documents/Research/Split_genes/input/Samples_PH207_Ref_HTseq.txt", head=T)
 b.Counts=read.table("~/Documents/Research/Split_genes/input/Samples_B73_Ref_HTseq.txt", head=T)
 w.Counts=read.table("~/Documents/Research/Split_genes/input/Samples_W22_Ref_HTseq.txt", head=T)
-
-
 setnames(p.splits, old = oldNames, new = newNames)
   setnames(p.fsplits, old = c(oldNames,"V11"), new = c(newNames, "source"))
   setnames(p.counts, old = c("Genes"), new = c("exon"))
@@ -747,27 +1130,18 @@ munge = function(counts, realSplits, fakeSplits){
   d.n$rep = as.factor(d.n$rep)
  return(d.n) 
 }
-
 p = munge(p.counts, p.splits, p.fsplits)
-
 nn = colnames(p.counts)[2:61]
 mm = c(rep("B",20), rep("P",20), rep("W",20))
 tt = c(rep(c("A","A","Em","Em","En","En","IE","IE","I","I","L10","L10","L","L","R","R","SC","SC","T","T"),3))
 rr = c(rep(c("R1","R2"),30))
 coldata = data.frame(row.names = nn, geno = mm, tissue = tt, rep = rr)
-
 nsg = dcast(p, gene + prog ~ variable, value.var = "value", fun.aggregate = sum)
-
 dds = DESeqDataSetFromMatrix(countData = nsg[,3:62], colData = coldata, design = ~ geno + tissue + rep)
-
 dds = DESeq(dds)
-
 disp = data.frame(gene = nsg$gene, disp = dispersions(dds))
-
 pp = merge(p, disp, by=c("gene"), all.x = TRUE)
-
 pp = pp %>%filter(as.character(parent) != as.character(gene)) %>% as.data.frame()
-
 #Obtains variance ratio from negative binomial glmm's
 vR = function(df){
   Theta = df$disp[1]
@@ -776,7 +1150,6 @@ vR = function(df){
   ratio = bb[bb$grp=="gene",4] / sum(bb[,4])
   return(ratio)
 }
-
 varRatio2 = function(i){
   Prog = as.character(unique(pp$prog)[i])
   dat = pp %>%filter(as.character(prog)==Prog) %>% as.data.frame()
@@ -784,7 +1157,6 @@ varRatio2 = function(i){
   #ratio = vR(dat)
   return(c(ratio, Prog))
 }
-
 #funciton for testing.  just runs one glmm and not all splitGenes
 runOne = function(master, Prog){
   dat = master %>%filter(as.character(prog)==Prog & as.character(parent) != as.character(gene) & value > 1) %>% as.data.frame()
@@ -796,7 +1168,6 @@ runOne = function(master, Prog){
   anova(bb,cc)
   return(c(aa,bb,cc))
 }
-
 #plot coverage for splitGene pair
 plotCov = function(master, Prog){
   dat = master %>%filter(as.character(prog)==Prog & as.character(parent) != as.character(gene)) %>% as.data.frame()
@@ -804,12 +1175,9 @@ plotCov = function(master, Prog){
   bb = ggplot(dat, aes(y=value, x = gene, fill=sample)) + geom_boxplot() + xlab("Sub-Gene") + ylab("TPM")
   grid.arrange(aa,bb)
 }
-
 ff = mclapply(1:length(unique(pp$prog)), FUN = varRatio2, mc.cores=3)
-
 ff = as.data.frame(do.call(rbind,ff))
 #100 jobs completes in 1.6 minutes
-
 getStats <- function(df, Theta){
   full = glmer(value ~ (1|tissue) + (1|sample) + (1 | gene), data=df, family=MASS::negative.binomial(theta=Theta))
   print(Theta)
@@ -827,7 +1195,6 @@ getStats <- function(df, Theta){
   dd['source'] = df$source[1]
   return(dd)
 }
-
 #Run negative binomial glmm to obtain variance ratios using COUNT data.  Automated for use with mclapply
 runNB <- function(i){
   Prog = as.character(unique(pp$prog)[i])
@@ -849,14 +1216,11 @@ runNB <- function(i){
     return(errD)}) 
   return(dat)
 }
-
 #More code for varRatio analaysis, but exploring lmer on tpm values instead of Counts...i think
 sg = rbind(munge(p.counts, p.splits, p.fsplits, oldNames, newNames), munge(b.counts, b.splits, b.fsplits, oldNames, newNames))
 sg = rbind(sg, munge(w.counts, w.splits, w.fsplits, oldNames, newNames))
-
 sg = sg %>%mutate(gene = 
                        case_when(is.na(as.character(gene)) ~ str_split_fixed(as.character(exon), "_", 2)[,1], TRUE ~ as.character(gene))) %>% as.data.frame()
-
 varRatio = function(gene_df){
   gene_df$tissue = as.factor(gene_df$tissue)
   gene_df$sample = as.factor(gene_df$sample)
@@ -866,28 +1230,21 @@ varRatio = function(gene_df){
   ratio = bb[bb$grp=="gene",4] / bb[bb$grp=="Residual",4]
   return(ratio)
 }
-
 #CALCULATE INTRA-CLASS CORELLATION FOR EACH PARENT WITH CHILDREN AS FACTOR.  HOW MUCH OF VARIANCE IS WITHIN CHILDREN VERSUS BETWEEN. PLOT DISTRIBUTION
-
 ee = sg %>%filter(!is.na(gene), famnum == 1) %>%filter(as.character(parent) != as.character(gene)) %>% group_by(ref, parent) %>%filter(nlevels(gene) > 1) %>%
 summarize(a=nlevels(tissue), b=nlevels(sample), c=nlevels(rep), d = nlevels(gene)) %>% as.data.frame()
-
 dd = sg %>%filter(!is.na(gene), famnum == 1) %>%  filter(as.character(parent) != as.character(gene)) %>% group_by(ref, parent) %>% 
 filter(nlevels(droplevels(gene)) > 1, ref != "BTX_623") %>%
 do(data.frame(. , vRatio = varRatio(.))) %>% as.data.frame()
-
 #SUBSET DATA TO INCLUDE ONLY SIMPLE SCENARIOS: 1 PARENT WITH 1 PROGENY SET (I.E PARENTS WITH FAMNUM==1.  THEN, CHECK OUT: 1 PARENT WITH EQUAL-SIZED PROGENY SETS ACROSS REFERENCES
-
 SG = sg %>%filter(!is.na(gene), famnum == 1) %>%  filter(as.character(parent) != as.character(gene)) %>% group_by(ref, parent) %>% 
 filter(nlevels(droplevels(gene)) > 1, ref != "BTX_623") %>% as.data.frame()
-
 vR = function(df){
   aa = glmer(value ~ (1|tissue) + (1|sample) + (1 | gene) + (rep | sample), data=df, family=poisson)
   bb = as.data.frame(VarCorr(aa))
   ratio = bb[bb$grp=="gene",4] / sum(bb[,4])
   return(ratio)
 }
-
 SG['comb'] = paste(SG$ref, SG$parent)
 varRatio2 = function(i){
   dat = SG[SG$comb==unique(SG$comb)[i],]
@@ -897,29 +1254,20 @@ varRatio2 = function(i){
   ratio = tryCatch({vR(dat)}, warning = function(w) {return(-9)})
   return(c(ratio, unique(SG$comb)[i]))
 }
-
 ff = mclapply(1:length(unique(SG$comb)), FUN = varRatio2, mc.cores=3)
-
 #Trimming exons
 b = p %>%filter(as.character(parent) != as.character(gene)) %>% group_by(gene) %>%filter(mean(value, na.rm=T) >5) %>% summarize(CV = sd(stdval, na.rm=T)/mean(stdval,na.rm=T), source = min(as.character(source)), parent = min(as.character(parent)))
 b = b %>%mutate(subGene = ifelse(gene %in% minmax$min,"geneA","geneB"))
-
 b = pp %>%filter(as.character(parent) != as.character(gene)) %>% group_by(gene) %>%filter(mean(value, na.rm=T) >0.01) %>% summarize(CV = sd(value, na.rm=T)/mean(value,na.rm=T), source = min(as.character(source)), parent = min(as.character(parent)))
 b = b %>%mutate(subGene = ifelse(gene %in% minmax$min,"geneA","geneB"))
-
 g = dcast(b, parent + source ~subGene, value.var="CV", fun.aggregate=mean)
 r = p %>%filter(as.character(parent) != as.character(gene)) %>% group_by(gene) %>%filter(mean(value, na.rm=T) >5) %>% summarize(mean= mean(value, na.rm=T), median = median(value, na.rm=T), CV = sd(value, na.rm=T)/mean(value,na.rm=T), harm=1/mean(1/value, na.rm=T), source = min(as.character(source)), parent = min(as.character(parent)))
-
 r = p %>%filter(as.character(parent) != as.character(gene)) %>% group_by(parent) %>%filter(mean(value, na.rm=T) >5) %>% spread(subGene, value) %>% as.data.frame()
-
 #Exploring dual filtering of minTPM and propLow
 results = read.table("~/Documents/Research/Split_genes/data/PH207_splitGenes_m4_exons_TPMdualfilt.txt",head=T)
 results2 = read.table("~/Documents/Research/Split_genes/data/PH207_splitGenes_m4_exons_ResVar2.txt",head=T)
-
 ggplot(results[results$minTPM==0.1 & results$propThresh==0.67,], aes(x=varRatio,fill=source))+geom_density(alpha=0.5)
-
 results = results %>%mutate(phsplit=ifelse(source=="fakeMerged", FALSE, str_detect(parent, "^Zm00008")))
-
 plot.vr.synt.2 = function(df, merged_quantile, split_quantile){
   n.m.counts = as.character(countExceeds(df[df$synt=="nonsynt" & df$phsplit==FALSE,], merged_quantile,split_quantile))
   n.s.counts = as.character(countExceeds(df[df$synt=="nonsynt" & df$phsplit==TRUE,], merged_quantile,split_quantile))
@@ -928,15 +1276,12 @@ plot.vr.synt.2 = function(df, merged_quantile, split_quantile){
   plt = ggplot(df, aes(x=varRatio, fill=source, y=synt)) + geom_density_ridges(alpha=0.5,scale=0.9) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit",]$varRatio, split_quantile), quantile(df[df$source=="fakeMerged",]$varRatio, merged_quantile)), linetype = "longdash") + facet_grid(~phsplit) + theme_bw() + annotate("text", x = 0.7, y = 1.3, label = paste("Merged =", n.m.counts[2],"; Split =", n.s.counts[1])) + annotate("text", x = 0.7, y = 2.4, label = paste("Merged =", s.m.counts[2],"; Split =", s.s.counts[1]))
   return(plt)
 }
-
 Results = munge5(results, pexon_counts, synt)
 RR = Results %>% group_by(minTPM,propThresh,source) %>% summarize(meanVR = mean(varRatio,na.rm=T))
 Results['id']=paste(Results$minTPM,Results$propThresh)
-
 Results2 = munge5(results2, pexon_counts, synt)
 RR2 = Results2 %>% group_by(minTPM,propThresh,source) %>% summarize(meanVR = mean(varRatio,na.rm=T))
 Results2['id']=paste(Results2$minTPM,Results2$propThresh)
-
 plot.expression = function(df, DF, parent_id, name){
   
   vR = DF[DF$parent==parent_id,]$varRatio[1]
@@ -954,7 +1299,6 @@ plot.expression = function(df, DF, parent_id, name){
   dpi = 300, limitsize = TRUE)
   dev.off()
 }
-
 plot.expression = function(df, DF, parent_id, name){
   vR = DF[DF$parent==parent_id,]$varRatio[1]
   df1 = df[df$parent==parent_id,]
@@ -964,19 +1308,12 @@ plot.expression = function(df, DF, parent_id, name){
   dpi = 300, limitsize = TRUE)
   dev.off()
 }
-
 Results2 = Results2 %>% group_by(minTPM, propThresh, source) %>%mutate(case = ifelse(varRatio > 0.9, "high", ifelse(varRatio < 0.1, "low", ifelse(abs(varRatio - 0.5) < 0.1, "mid", "none")))) %>% as.data.frame()
-
 Results %<>% group_by(source) %>%mutate(case = ifelse(varRatio > 0.9, "high", ifelse(varRatio < 0.1, "low", ifelse(abs(varRatio - 0.5) < 0.1, "mid", "none")))) %>% as.data.frame()
-
 dd = Results2 %>%filter(minTPM==0.05 & propThresh==0.25 & source=="fakeMerged" & case=="low") %>%select(parent, tissue, gene, sample, Residual) %>% as.data.frame()
-
 tmp = Results2 %>%filter(source!="real" & case!="none") %>% group_by(source,case) %>%filter(minTPM=="0.5" & propThresh==0.5) %>% select(parent, tissue, gene, sample, Residual, case, source) %>% as.data.frame()
-
 Results2 %>%filter(source!="real" & case!="none") %>%filter(minTPM=="0.5" & propThresh==0.5) %>% select(parent, tissue, gene, sample, Residual, case, source) %>% group_by(source,case) %>%  do(plotCases(.,II,20,paste(first(.$source), first(.$case),sep="")))
-
 Results %>%filter(source!="real" & case!="none") %>%select(parent, tissue, gene, sample, Residual, case, source) %>% group_by(source,case) %>%  do(plotCases(.,II,20,paste(first(.$source), first(.$case),sep="")))
-
 plotCases = function(DF, df, num_cases, Name){
   DF = DF %>% sample_n(num_cases) %>% droplevels() %>% as.data.frame()
   print(str(melt(DF,id.var=c("parent", "case", "source"))))
@@ -995,48 +1332,35 @@ plotCases = function(DF, df, num_cases, Name){
     plot.expression(df, DF, par, Name)
   }
 }
-
 plotCases(tmp[tmp$source=="fakeMerged" & tmp$case=="low",], II, 20, "fakeMerge_Low")
-
 for (i in 1:nrow(jj)){
 par = as.character(jj[i,]$parent)
 Name = as.character(jj[i,]$source)
 print(paste(par,Name))
 plot.expression(II, Results, par, Name)
 }
-
 #Adding synteny info
 synt = read.table("~/Documents/Research/MaizeSV/misc/SyntenicGenes_BandP.txt")
 results = read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4.txt", head =T)
 results = results %>%filter(status!="error")
-
 pexon_counts = p %>%filter(sample=="B" & tissue == "A" & rep == "R1" & as.character(gene)!=as.character(parent)) %>% group_by(parent) %>% summarize(n = n(), source=min(as.character(source)), meantpm = mean(value))
-
 meantpms = p %>%filter(as.character(gene)!=as.character(parent)) %>% group_by(parent) %>% summarize(n = n(), source=min(as.character(source)), meantpm = mean(value))
-
 Results = merge(results, pexon_counts, by="parent")
-
 RResults = Results %>%mutate(synt = if_else(source=="fakeMerged",if_else(substr(as.character(parent),1,nchar(as.character(parent))-1) %in% synt$V1,"syntenic","nonsynt"), if_else(parent %in% synt$V1,"syntenic","nonsynt"))) %>% as.data.frame()
-
-
 results1=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.01.txt",header = T)
 results2=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.01_rmvFandL.txt",header = T) #Removing first and last exon of parent gene makes distributions wonky.
 results3=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.05.txt",header = T)
 results4=read.table("~/Documents/Research/MaizeSV/data/PH207_splitGenes_m4_exons_tpm0.5.txt",header = T)
-
 munge5 = function(df, exon_counts, synteny_key){
   df = df %>%filter(status!="error" & tissue != "tissue")
   df = merge(df,exon_counts, by=c("parent","source"))
   df = df %>%mutate(synt = if_else(source=="fakeMerged",if_else(substr(as.character(parent),1,nchar(as.character(parent))-1) %in% synteny_key$V1,"syntenic","nonsynt"), if_else(parent %in% synteny_key$V1,"syntenic","nonsynt"))) %>% as.data.frame()
   return(df)
 }
-
-
 Results1 = munge4(results1, pexon_counts, synt)
 Results2 = munge4(results2, pexon_counts, synt)
 Results3 = munge4(results3, pexon_counts, synt)
 Results4 = munge4(results4, pexon_counts, synt)
-
 plot.vr.synt = function(df, merged_quantile, split_quantile){
   n.counts = as.character(countExceeds(df[df$synt=="nonsynt",], merged_quantile,split_quantile))
   s.counts = as.character(countExceeds(df[df$synt=="syntenic",], merged_quantile,split_quantile))
@@ -1045,41 +1369,31 @@ plot.vr.synt = function(df, merged_quantile, split_quantile){
   plt = ggplot(df, aes(x=varRatio, fill=source, y=synt)) + geom_density_ridges(alpha=0.5,scale=0.9) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit" & df$synt=="syntenic",]$varRatio, split_quantile,na.rm=T), quantile(df[df$source=="fakeMerged" & df$synt=="syntenic",]$varRatio, merged_quantile, na.rm=T)), linetype = "longdash") + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit"  & df$synt=="nonsynt",]$varRatio, split_quantile, na.rm=T), quantile(df[df$source=="fakeMerged"  & df$synt=="nonsynt",]$varRatio, merged_quantile, na.rm=T)), linetype = "longdash", color="red") + theme_bw() + annotate("text", x = 0.9, y = 1.3, label = paste("Merged =", n.counts[2],"; Split =", n.counts[1])) + annotate("text", x = 0.9, y = 2.4, label = paste("Merged =", s.counts[2],"; Split =", s.counts[1]))
   return(plt)
 }
-
 plot.vr = function(df, merged_quantile, split_quantile){
   counts = as.character(countExceeds(df, merged_quantile,split_quantile))
   plt = ggplot(df, aes(x=varRatio, fill=source)) + geom_density(alpha=0.5) + geom_vline(xintercept = c(quantile(df[df$source=="fakeSplit",]$varRatio, split_quantile,na.rm=T), quantile(df[df$source=="fakeMerged",]$varRatio, merged_quantile, na.rm=T)), linetype = "longdash") + theme_bw() + annotate("text", x = 0.7, y = 1.3, label = paste("Merged =", counts[2],"; Split =", counts[1]))
   return(plt)
 }
-
 countExceeds = function(df, merged_quantile, split_quantile){
   mq = quantile(df[df$source == "fakeMerged",]$varRatio, merged_quantile, na.rm = T)
   sq = quantile(df[df$source == "fakeSplit",]$varRatio, split_quantile, na.rm = T)
   counts = df %>%filter(source=="real") %>%mutate(split = ifelse(varRatio > sq, 1,0), merged = ifelse(varRatio < mq, 1, 0)) %>% summarize(splits = sum(split,na.rm=T), mergeds = sum(merged,na.rm=T))
   return(counts)
 }
-
-
 plot.vr.synt(Results3,0.1,0.9)
 plot.vr.synt(Results4,0.1,0.9)
-
 plot.vr.exon.synt = function(df, min_exon_count, max_exon_count){
   plt = ggplot(df[df$n > min_exon_count & df$n < max_exon_count,], aes(x=varRatio, fill=source, y=synt)) + geom_density_ridges(alpha=0.5,scale=0.9)+facet_grid(~n)
   return(plt)
 }
-
 plot.vr.exon.synt(Results1,10,20)
 plot.vr.exon.synt(Results2,10,20)
 plot.vr.exon.synt(Results3,10,20)
 plot.vr.exon.synt(Results4,10,20)
-
-ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
-
 ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
 ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
-
 ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
-
+ggplot(Results4,aes(x=varRatio, fill=source, y=synt))+geom_density_ridges(alpha=0.5,scale=0.9)+geom_vline(xintercept=c(quantile(Results4[Results4$source=="fakeSplit",]$varRatio,0.9), quantile(Results4[Results4$source=="fakeMerged",]$varRatio,0.1)), linetype = "longdash")+theme_bw()
 #For two PH207 genes to be potentially merged into 1 W22 gene, compare to PH207 fakeMerge.  what is null distribution if we would randomly put two adjacent PH207 genes together?
 #What about combining this metric with the alternative?
 #For the same prog set as above, if we have 2P -> 1W, but mapped to W22, compare to W22 fakeSplits?
@@ -1088,108 +1402,10 @@ results1 = results1 %>%mutate(phsplit=ifelse(source=="fakeMerged", FALSE, str_de
 results1[results1$source=="fakeSplit",]$phmerged=FALSE
 ```
 
+
 B73 and W22 convert well to PH207, but PH207 does not convert as well to B and W. Genes that fail to convert tend to be a bit longer than the genes that successfully convert. 
 ```{r}
 Ccr = ccr %>% group_by(from, to, match) %>% summarise(n = n(), medlen = median(len)) %>% as.data.frame()
-
 ggplot() + geom_point(data=Ccr, aes(x=from, y=n,shape=match,color=to)) + theme_bw()
-
 ggplot(ccr, aes(x=len/1000, y=to , fill=match)) + geom_density_ridges(alpha=0.5) + scale_x_log10() + facet_grid(~from) + xlab("Gene Length (kb)") + ylab("Converted to")
 ```
-
-Look for effect of minimum exon number flag in simulating splitMerges.  Also consider effect of multiple isoforms
-```{r}
-mi = read.table("~/Documents/Research/Maize/references/multiIsoform_B73.txt")
-
-P.r20 = calcM2f(pp20, "P", minTPM = 0.01)
-B.r20 = calcM2f(bb20, "B", minTPM = 0.01)
-W.r.jm20 = calcM2f(ww.jm20, "W", minTPM = 0.01)
-W.r.ab = calcM2f(ww.ab, "W", minTPM = 0.01)
-
-all['min.exons'] = 4
-W.r.jm2['ref'] = "W"
-B.r2['ref'] = "B"
-P.r2['ref'] = "P"
-W.r.jm2['min.exons'] = 2
-B.r2['min.exons'] = 2
-P.r2['min.exons'] = 2
-W.r.jm20['ref'] = "W"
-B.r20['ref'] = "B"
-P.r20['ref'] = "P"
-W.r.jm20['min.exons'] = 20
-B.r20['min.exons'] = 20
-P.r20['min.exons'] = 20
-W.r.jm8['ref'] = "W"
-B.r8['ref'] = "B"
-P.r8['ref'] = "P"
-W.r.jm8['min.exons'] = 8
-B.r8['min.exons'] = 8
-P.r['min.exons'] = 8
-
-All = do.call("rbind",list(all,W.r.jm2,B.r2,P.r2,W.r.jm20,B.r20,P.r20,W.r.jm8,B.r8,P.r8))
-All %>% filter(source=="fakeSplit") %>% ggplot(.,aes(x=M2f,fill=multiIso))+geom_density(alpha=0.5)+facet_grid(rows = vars(as.factor(min.exons)),cols = vars(ref))+scale_x_log10(limits=c(0.1,12))
-All %>% mutate(multiIso = ifelse(parent %in% mi$V1, 1,0)) %>% group_by(ref,source,min.exons) %>% summarise(num_multIso = sum(multiIso), n = n(), prop = sum(multiIso) / n())
-
-#M2f distributions
-W.r['geno']="W"
-B.r['geno']="B"
-P.r['geno']="P"
-
-ALL = do.call("rbind",list(W.r,P.r,B.r))
-
-ALL %<>% mutate(Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T), "Split", ifelse(M2f < quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T), "Merged", "NoCall")))
-
-ALL %>% filter(source=="real") %>% ggplot(.,aes(fill=geno,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="Genotype",values=wes_palette("GrandBudapest1"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
-
-
-ALL %>% filter(source %in% c("real")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1")) + ylim(0,1.4) 
-
-
-ALL %>% filter(source %in% c("real","fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1")) + ylim(0,1.4)
-ALL %>% filter(source %in% c("real","fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4)
-ALL %>% filter(source %in% c("real","fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4)
-ALL %>% filter(source %in% c("real","fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates","Sim. Splits", "Sim. Merged"),values=wes_palette("Darjeeling1")) + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4)
-
-ALL %>% filter(source %in% c("real","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates", "Sim. Merged"),values=wes_palette("Darjeeling1")) + ylim(0,1.4)
-ALL %>% filter(source %in% c("real","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("All Candidates", "Sim. Merged"),values=wes_palette("Darjeeling1")) + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4)
-
-
-ALL %>% filter(source %in% c("fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3")) + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
-
-ALL %>% filter(source %in% c("fakeSplit")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
-
-ALL %>% filter(source %in% c("fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3"))+ geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
-ALL %>% filter(source %in% c("fakeSplit","fakeMerged")) %>% ggplot(.,aes(fill=source,x=M2f))+geom_density(alpha=0.5)+scale_x_log10(limits=c(0.1,10)) + theme_bw() + scale_fill_manual(name="",labels=c("Sim. Splits", "Sim. Merged"),values=wes_palette("Moonrise3")) + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T),linetype="dashed") + geom_vline(xintercept = quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T),linetype="dashed") + ylim(0,1.4) + ylab("") + theme(axis.text.y=element_blank(),axis.text.x=element_text(size=14),axis.title.x=element_text(size=16),legend.text = element_text(size=14))
-
-ALL %<>% mutate(Call = ifelse(M2f > quantile(ALL[ALL$source=="fakeSplit",]$M2f,0.9,na.rm=T), "Split", ifelse(M2f < quantile(ALL[ALL$source=="fakeMerged",]$M2f,0.1,na.rm=T), "Merged", "NoCall")))
-
-ALL$Call=as.factor(ALL$Call)
-ALL$Call=factor(ALL$Call,levels(ALL$Call)[c(2,1,3)])
-
-ALL %<>% mutate(Par = ifelse(grepl("Zm00001", parent),"B",ifelse(grepl("Zm00008",parent),"P","W")))
-
-
-
-
-ALL %>% filter(source=="real" & !is.na(Call)) %>% group_by(Par,geno,Call) %>% summarize(n=n()) %>% ggplot(.,aes(x=Call,fill=Call,y=n))+geom_bar(stat="identity") + facet_grid(rows=vars(geno),cols = vars(Par)) + xlab("") + theme_bw()+ theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) + theme(axis.text.x=element_blank(), axis.title.y = element_text(size=18), axis.text.y=element_text(size=16), legend.title=element_text(size=18), legend.text = element_text(size=16), axis.ticks.x=element_blank(), strip.text = element_text(size=16)) + scale_fill_manual(values = c("#F8766D", "#00BA38", "#619CFF"))
-
-```
-
-#IsoSeq analysis
-```{r}
-iso2 = read.table("~/Documents/Research/Maize/B73_isoseq/IsoSeq.sa.mq20.counts")
-
-iso = read.table("~/Documents/Research/Maize/B73_isoseq/IsoSeq.sa.counts")
-
-iso2['parent'] = iso2$V4
-PP.r %<>% left_join(.,iso2,by="parent")
-
-#Require reciprocal overlap of 0.75 for both isoseq reads and genes.  prevents overly long reads that span a gene but don't actually align to it at all.  
-iso3 = read.table("~/Documents/Research/Maize/B73_isoseq/IsoSeq.sa.mq20.Ff75.counts")
-iso3['parent'] = iso3$V4
-ALL %<>% left_join(.,iso3,by="parent")
-```
-
-
-
-
