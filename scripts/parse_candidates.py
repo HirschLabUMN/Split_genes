@@ -19,25 +19,67 @@ import os
 
 def parseFile(in_file, td_thresh):
 
+    def getOverlap(a, b):
+        a.sort()
+        b.sort()
+        return max(0, min(int(a[1]), int(b[1])) - max(int(a[0]), int(b[0]))) / max(0, max(int(a[1]), int(b[1])) - min(int(a[0]), int(b[0])))
+
     split_dict = {}
     sets = 0
+    Ovlps = 0
+    NOvlps = 0
+    AOP = 0 # average proportion of overlap
+    os = 0 # counter for opposite strands
+    nos = 0 
+    tds = 0 
+    nadj = 0
     with open(in_file, 'r') as inFile:
         for i, line in enumerate(inFile):
             if i > 0 and line[0] != "#" and "combinations" not in line:
                 line = line.split()
                 td = float(line[-1])
-                if "non-adjacent_syntenic" not in line and td <= td_thresh:
+
+                opposite_strands = line[17]
+                # print(td, opposite_strands)
+                if "non-adjacent_syntenic" not in line and td <= td_thresh and opposite_strands == "False":
+                    if opposite_strands == "False": nos += 1
                     sets += 1
-                    splits = line[14]
+                    splits = line[14].split(";")
                     prog_string = ""
-                    for split in splits.split(";"):
+                    Coords = []
+                    for split in splits:
                         coords = split.split(",")
                         coords = [x.replace('"','') for x in coords]
                         prog_string += coords[0] + ","
-                    for split in splits.split(";"):
+                        Coords.append(coords[2:4])
+                    ovlps = []
+                    for pair in itertools.combinations(Coords, 2):
+                        # pdb.set_trace()
+                        if getOverlap(*pair) > 0:
+                            ovlps.append(pair)
+                            # print(splits)
+                            Ovlps += 1
+                            AOP += getOverlap(*pair)
+                        else: NOvlps += 1
+                    ovlps = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(ovlps))))
+                    #Get blacklisted index of genes that overlap...or just use coordinates and hope they are unique??
+                    for split in splits:
                         coords = split.split(",")
-                        out = [coords[1], coords[2], coords[3], coords[0], line[1], prog_string[:-1]]
-                        split_dict[coords[0]] = out
+                        if coords[2] not in ovlps and coords[3] not in ovlps:
+                            out = [coords[1], coords[2], coords[3], coords[0], line[1], prog_string[:-1]]
+                            split_dict[coords[0]] = out
+                elif "non-adjacent_syntenic" in line: nadj += 1
+                elif opposite_strands == "True": os += 1
+                elif td >= td_thresh: tds += 1
+                
+                        # else: pdb.set_trace()
+    if Ovlps > 0:
+        print(f"# overlaps = {Ovlps}; # non-overlaps = {NOvlps}; prop overlaps {Ovlps / (Ovlps + NOvlps)}; avg. overlap {AOP / Ovlps}")
+    else: print(f"no overlaps")
+    print(f"# opp. strands = {os}; # non-opp. strands = {nos}; prop opp. strands {os / (os + nos)}")
+    print(f"# tandem dups = {tds}; # non-adjacent_syntenic genes = {nadj}")
+    print(f"{i} total one-to-many homologies")
+
     return(split_dict)
 
 def getMate(gene, idx):
@@ -54,13 +96,19 @@ def getExons(annotation_path, real_dict, split_prop, merge_prop):
     merged_B = {}
     unchanged = {}
     Real = {}
+
+    #Get candidate split genes to screen out of simulations
+    ss = list(real_dict.keys())
+    for s in real_dict.keys():
+        ss.append(real_dict[s])
+
     with open(annotation_path, 'r') as gff:
         for i, line in enumerate(gff):
             if line[0][0] == "#": continue
             line = line.strip().split("\t")
             if line[2] == "gene":
                 gene = line[8].strip().split("=")[1].split("_")[0].split(";")[0].split(".")[0] #This is not very generalized
-                if gene not in real_dict.keys(): # Only make fake split/merges if this gene is not part of a putative split/merge
+                if gene not in ss: # Only make fake split/merges if this gene is not part of a putative split/merge
                     rx = random.uniform(0, 1)
                     if gene not in merged_B: # Prevents this gene + next_gene from being chosen for merging if this gene was already part of a previous merge
                         if rx < split_prop: # make a random split; p is min number of exons
@@ -151,8 +199,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "parse split-gene candidates into bed format for bedtools intersect with longest transcript gff.")
     parser.add_argument('-i', type=str, metavar='input_file', required=True, help='reciprocal split-gene candidates from the syntenic homology pipeline')
     parser.add_argument('-o', type=str, metavar='output_dir', required=True, help='full path')
-    parser.add_argument('-m', type=str, metavar='metadata_file', required=True, help='metadata file for input file.  3 lines; two columns. Tab-separated.  First line = gff paths, Second line = gene prefix, third line = genotype id (must match naming convention in RNAseq samples)')
-    parser.add_argument('-t', type=float, metavar='tandem_dup_threshold', default = 0, help='cds size - the number of base pairs both genes overlap over the cds / the size of the cds')
+    parser.add_argument('-a', type=str, metavar='annotations', required=True, help='comma-separated list (no spaces) of the two annotations (with genes and exons) that correspond to the two annotations compared in the input file')
+    parser.add_argument('-n', type=str, metavar='sample_ids', required=True, help='comma-separated list (no spaces) of the genotype names that correspond to the two annotations (same order).  This should match naming convention used for naming samples in RNAseq output')
+    parser.add_argument('-t', type=float, metavar='tandem_dup_threshold', default = 0.1, help='cds size - the number of base pairs both genes overlap over the cds / the size of the cds')
     parser.add_argument('-e', type=int, metavar='minimum_exons', default = 4, help="minimum number of exons required to make a simulated split gene")
     parser.add_argument('-S', type=float, metavar='split_proportion', required=False, default=0.2, help="proportion of genes for which we want to make simulated splits")
     parser.add_argument('-M', type=float, metavar='merged_proportion', required=False, default=0.3, help="proportion of genes for which we want to make simulated merge")
@@ -163,18 +212,17 @@ if __name__ == "__main__":
 
     if not os.path.exists(args.o): os.makedirs(args.o)
 
+
+    #PRINT TOTAL NUMBER OF CANDIDATES FOR EACH RUN AT END
+
     #This needs to return a list holding all of the information for split genes that we intend to print later
     real_parsed = parseFile(args.i, args.t)
 
-    ## Not sure this metadata is necessary.  Could just do a comma separated list for annotation and sample name.  not using the gene ids.
-    dat = [] #dat[0] = annotations, dat[1] = gene prefix, dat[2] = genotype id
-    with open(args.m, 'r') as meta: # Retrieve metadata from file
-        for l in meta:
-            dat.append(l.split())
-    
+    annotations = args.a.split(",")
+    names = args.n.split(",")    
 
-    for i, annot in enumerate(dat[0]):
-        outfile = f"{args.o}/{dat[2][i]}splits_{''.join(dat[2])}_td{args.t}_m{args.e}"
+    for i, annot in enumerate(annotations):
+        outfile = f"{args.o}/{names[i]}splits_{''.join(names)}_td{args.t}_m{args.e}"
         sim_splits, sim_merged_A, sim_merged_B, unchanged, real = getExons(annot, real_parsed, args.S, args.M)
         writeSim(sim_splits, sim_merged_A, sim_merged_B, unchanged, real, real_parsed, outfile, args.e)
 

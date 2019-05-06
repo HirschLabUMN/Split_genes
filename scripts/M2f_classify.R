@@ -19,24 +19,29 @@ summarize <- dplyr::summarize
 
 
 ##################### BEGIN: Read arguments ##################
+
+args = commandArgs(trailingOnly=TRUE)
+
 split_file = args[1] # Output from parse_candidates.py
 count_file = args[2] # Output from HTseq counts (per exon)
 outfile = args[3] 
 sampleID = args[4] # String that identifies samples to be used for M2f .e.g. "W" for W22 in our data
-upper_quantile = args[5] # M2f quantile of null distribution above which candidates will be classified as split
-lower_quantile = args[6] # M2f quantile of null distribution below which candidates will be classified as merged
-minTPM = args[7] # Only include a gene in M2f calculation if normalized expression (TPM) is above this value.  
+upper_quantile = as.numeric(args[5]) # M2f quantile of null distribution above which candidates will be classified as split
+lower_quantile = as.numeric(args[6]) # M2f quantile of null distribution below which candidates will be classified as merged
+minTPM = as.numeric(args[7]) # Only include a gene in M2f calculation if normalized expression (TPM) is above this value.  
 if(minTPM == -9){ # default value of minTPM
   minTPM = 0.01
 }
-read_length = args[8] # Needed for normalization.  Length of RNAseq reads
-num_obs = args[9] # Number of observations for the sample in question.  E,g. Number of tissues * number of reps
+read_length = as.numeric(args[8]) # Needed for normalization.  Length of RNAseq reads
+num_obs = as.numeric(args[9]) # Number of observations for the sample in question.  E,g. Number of tissues * number of reps
 ##################### END: Read arguments ##################
 
 ##################### BEGIN: Load Data ##################
 splits = read.table(split_file, head=T)
 counts = read.table(count_file, head=T)
 
+#Remove any duplicates
+splits %<>% distinct()
 ##################### END: Load Data ##################
 
 
@@ -114,6 +119,7 @@ munge = function(df, melt_by){
 #Major function that takes exon-based count data from HTseq (counts), and a file from parse_candidates.py.  If evaluating split genes in W, use count data from W mapped to W
 formatData = function(counts, splits, minTPM = 0, sampleID = c("B", "P", "W"), minGenes = 1, fmt="de", readLength = read_length, numObs = num_obs){
   print("Munging...")
+  splits %<>% distinct()
   d = merge(splits, counts, by = c("exon"), all.y=TRUE)
   Names = c("exon","pos.exon","end.exon","gene","pos.gene","end.gene","parent","prog", "source")
   p = munge(d, c(Names, "chrom"))
@@ -174,7 +180,7 @@ M2f = calcM2f(dat, sampleID, minTPM = minTPM)
 split_cutoff = quantile(M2f[M2f$source=="simSplit",]$M2f, upper_quantile, na.rm=T)
 merge_cutoff = quantile(M2f[M2f$source == "simMerged",]$M2f, lower_quantile, na.rm=T)
 
-M2f %<>% mutate(Call = ifelse(M2f > split_cutoff, "Split", ifelse(M2f < merge_cutoff, "Merged", "NoCall")))
+M2f %<>% mutate(Call = ifelse(M2f > split_cutoff, "Split", ifelse(M2f < merge_cutoff, "Merged", "NoCall")), ref = sampleID)
 
 write.table(M2f, outfile, quote = F, row.names = F)
 ######################## END: CALC M2F ############################################
