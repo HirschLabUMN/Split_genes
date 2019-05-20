@@ -20,6 +20,7 @@ import os
 def parseFile(in_file, td_thresh):
 
     def getOverlap(a, b):
+        # This calculates proportional overlap between a pair of coordinates
         a.sort()
         b.sort()
         return max(0, min(int(a[1]), int(b[1])) - max(int(a[0]), int(b[0]))) / max(0, max(int(a[1]), int(b[1])) - min(int(a[0]), int(b[0])))
@@ -33,6 +34,8 @@ def parseFile(in_file, td_thresh):
     nos = 0 
     tds = 0 
     nadj = 0
+    OS = [0, 0, 0] #HOlds info for opposite strand split-genes
+    SS = [0, 0, 0]
     with open(in_file, 'r') as inFile:
         for i, line in enumerate(inFile):
             if i > 0 and line[0] != "#" and "combinations" not in line:
@@ -41,8 +44,7 @@ def parseFile(in_file, td_thresh):
 
                 opposite_strands = line[17]
                 # print(td, opposite_strands)
-                if "non-adjacent_syntenic" not in line and td <= td_thresh and opposite_strands == "False":
-                    if opposite_strands == "False": nos += 1
+                if "non-adjacent_syntenic" not in line :
                     sets += 1
                     splits = line[14].split(";")
                     prog_string = ""
@@ -54,27 +56,53 @@ def parseFile(in_file, td_thresh):
                         Coords.append(coords[2:4])
                     ovlps = []
                     for pair in itertools.combinations(Coords, 2):
-                        # pdb.set_trace()
-                        if getOverlap(*pair) > 0:
+                        o = getOverlap(*pair)
+                        if o > 0:
                             ovlps.append(pair)
                             # print(splits)
-                            Ovlps += 1
-                            AOP += getOverlap(*pair)
-                        else: NOvlps += 1
+                            if opposite_strands == "True": 
+                                OS[1] += 1
+                                OS[2] += o
+                            else: 
+                                SS[1] +=1
+                                SS[2] += o
+                             #Opposite strands average overlap
+                        else: 
+                            if opposite_strands == "True": OS[0] += 1
+                            else: SS[0] += 1
                     ovlps = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(ovlps))))
-                    #Get blacklisted index of genes that overlap...or just use coordinates and hope they are unique??
-                    for split in splits:
-                        coords = split.split(",")
-                        if coords[2] not in ovlps and coords[3] not in ovlps:
-                            out = [coords[1], coords[2], coords[3], coords[0], line[1], prog_string[:-1]]
-                            split_dict[coords[0]] = out
+                    
+                    if opposite_strands == "False" and td <= td_thresh:
+                        nos += 1
+                        for split in splits:
+                            coords = split.split(",")
+                            if coords[2] not in ovlps and coords[3] not in ovlps: # Dont store coordinates if they are contained in the black-listed set of coordinates (ovlps)
+                                out = [coords[1], coords[2], coords[3], coords[0], line[1], prog_string[:-1]]
+                                split_dict[coords[0]] = out
+                    elif opposite_strands == "True": os += 1
+                    else: 
+                        tds += 1
+                        nos += 1
                 elif "non-adjacent_syntenic" in line: nadj += 1
-                elif opposite_strands == "True": os += 1
-                elif td >= td_thresh: tds += 1
                 
                         # else: pdb.set_trace()
-    if Ovlps > 0:
-        print(f"# overlaps = {Ovlps}; # non-overlaps = {NOvlps}; prop overlaps {Ovlps / (Ovlps + NOvlps)}; avg. overlap {AOP / Ovlps}")
+    if OS[1] > 0:
+        print(f"# overlaps: Opp. Strand = {OS[1]}")
+        print(f"# non-overlaps: Opp. Strand = {OS[0]}")
+        print(f"prop overlaps: Opp. Strand = {OS[1] / (OS[0] + OS[1])}")
+        print(f"avg. overlap: Opp. Strand = {OS[2] / OS[1]}")
+    else: print(f"no opposite strand overlaps")
+    if SS[1] > 0 :
+        print(f"# overlaps: Same Strand = {SS[1]}")
+        print(f"# non-overlaps: Same Strand = {SS[0]}")
+        print(f"prop overlaps: Same Strand = {SS[1] / (SS[0] + SS[1])}")
+        print(f"avg. overlap: Same Strand = {SS[2] / SS[1]}")
+    else: print(f"no same strand overlaps")
+    if SS[1] + OS[1] > 0 :
+        print(f"# overlaps: Combined = {OS[1] + SS[1]}")
+        print(f"# non-overlaps: Combined = {OS[0] + SS[0]}")
+        print(f"prop overlaps: Combined = {(OS[1] + SS[1]) / ((OS[1] + SS[1]) + (OS[0] + SS[0]))}")
+        print(f"avg. overlap: Combined =  {(OS[2] + SS[2])/ (OS[1] + SS[1])}")
     else: print(f"no overlaps")
     print(f"# opp. strands = {os}; # non-opp. strands = {nos}; prop opp. strands {os / (os + nos)}")
     print(f"# tandem dups = {tds}; # non-adjacent_syntenic genes = {nadj}")
